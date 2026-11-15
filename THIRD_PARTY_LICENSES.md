@@ -19,7 +19,7 @@ The full text of the SIL Open Font License is in
 
 | Module | License |
 |--------|---------|
-| [gioui.org](https://gioui.org) (incl. `gioui.org/shader`) | MIT OR Unlicense (dual) |
+| [gioui.org](https://gioui.org) (incl. `gioui.org/shader`; v0.10.3 vendored with patches in [`third_party/gio`](third_party/gio)) | MIT OR Unlicense (dual) |
 | [github.com/ebitengine/oto/v3](https://github.com/ebitengine/oto) | Apache-2.0 |
 | [github.com/ebitengine/purego](https://github.com/ebitengine/purego) | Apache-2.0 |
 | [github.com/hajimehoshi/go-mp3](https://github.com/hajimehoshi/go-mp3) | Apache-2.0 |
