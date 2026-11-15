@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxfixes-dev \
+            libgles2-mesa-dev libegl1-mesa-dev libxcursor-dev libvulkan-dev \
+            libasound2-dev pkg-config
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Optional arm64 build. Gio requires cgo, so arm64 binaries are best built
+  # on a native arm64 runner. To enable:
+  #   1. Uncomment this job.
+  #   2. Add a second goreleaser config (e.g. .goreleaser-arm64.yaml) with
+  #      goarch: [arm64] and `release: { mode: append }`, and no checksum
+  #      clash (e.g. checksum name_template: checksums-arm64.txt).
+  #   3. Make it run after the amd64 job so the GitHub release exists.
+  #
+  # goreleaser-arm64:
+  #   needs: goreleaser
+  #   runs-on: ubuntu-24.04-arm
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         fetch-depth: 0
+  #     - uses: actions/setup-go@v5
+  #       with:
+  #         go-version-file: go.mod
+  #     - name: Install system dependencies
+  #       run: |
+  #         sudo apt-get update
+  #         sudo apt-get install -y --no-install-recommends \
+  #           libwayland-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxfixes-dev \
+  #           libgles2-mesa-dev libegl1-mesa-dev libxcursor-dev libvulkan-dev \
+  #           libasound2-dev pkg-config
+  #     - uses: goreleaser/goreleaser-action@v6
+  #       with:
+  #         distribution: goreleaser
+  #         version: "~> v2"
+  #         args: release --clean --config .goreleaser-arm64.yaml
+  #       env:
+  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
