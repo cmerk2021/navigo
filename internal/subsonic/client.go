@@ -53,6 +53,10 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("server error %d", e.Code)
 }
 
+// Permanent reports that retrying the request won't help (used by the
+// track cache's retry logic).
+func (e *Error) Permanent() bool { return true }
+
 // HTTPError is returned for non-2xx HTTP responses.
 type HTTPError struct {
 	StatusCode int
@@ -60,6 +64,10 @@ type HTTPError struct {
 }
 
 func (e *HTTPError) Error() string { return "HTTP error: " + e.Status }
+
+// HTTPStatus returns the status code (used by the cache to classify errors
+// without importing this package).
+func (e *HTTPError) HTTPStatus() int { return e.StatusCode }
 
 // ErrTimeout is returned (wrapped) when a request times out.
 var ErrTimeout = errors.New("request timed out")
@@ -205,7 +213,9 @@ type Client struct {
 	password string
 	// api is used for small JSON requests (short timeout).
 	api *http.Client
-	// stream is used for media downloads (no overall timeout).
+	// stream is used for media downloads. It has no overall timeout so long
+	// downloads aren't killed; connect/TLS/header timeouts come from the
+	// transport and body stalls are detected by the cache's idle timer.
 	stream *http.Client
 }
 
@@ -231,9 +241,10 @@ func New(baseURL, user, password string, insecureTLS bool) (*Client, error) {
 	u.Path = strings.TrimSuffix(u.Path, "/")
 	tr := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: 20 * time.Second,
+		ExpectContinueTimeout: time.Second,
 		IdleConnTimeout:       90 * time.Second,
 		MaxIdleConnsPerHost:   6,
 		ForceAttemptHTTP2:     true,

@@ -118,6 +118,7 @@ type flacDec struct {
 	scale  float32
 	rate   int
 	length int64
+	pos    int64 // frames decoded
 	rg     ReplayGain
 }
 
@@ -154,6 +155,11 @@ func (d *flacDec) Read(dst []float32) (int, error) {
 	for len(d.pend) == 0 {
 		f, err := d.s.ParseNext()
 		if err != nil {
+			if err != io.EOF && d.length > 0 && d.pos >= d.length {
+				// All samples were decoded; what follows (an ID3v1 tag,
+				// padding) isn't audio.
+				return 0, io.EOF
+			}
 			return 0, err
 		}
 		if len(f.Subframes) == 0 {
@@ -173,6 +179,7 @@ func (d *flacDec) Read(dst []float32) (int, error) {
 			d.pend[2*i] = float32(l[i]) * d.scale
 			d.pend[2*i+1] = float32(r[i]) * d.scale
 		}
+		d.pos += int64(ns)
 	}
 	n := copy(dst, d.pend)
 	n &^= 1
@@ -186,6 +193,7 @@ func (d *flacDec) SeekFrame(frame int64) error {
 	if err != nil {
 		return err
 	}
+	d.pos = int64(start)
 	skip := frame - int64(start)
 	buf := make([]float32, 4096)
 	for skip > 0 {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net"
 	"net/url"
@@ -55,6 +56,9 @@ type Snapshot struct {
 	Volume     float64
 	Muted      bool
 	Previewing bool
+	// Loading is set while playback is wanted but no audio is being output
+	// yet (Loading) or anymore (Buffering).
+	Loading bool
 }
 
 type previewState struct {
@@ -90,11 +94,19 @@ type Player struct {
 	nextReq       cache.Request
 	nextEntry     *cache.Entry
 	failStreak    int
-	scrobbled     bool
-	artPath       string
-	artFor        string
-	preview       *previewState
-	dirty         atomic.Bool
+	// Recovery attempts for the current song (reset when it changes).
+	retrySong    string
+	refetched    bool
+	startRetried bool
+	// Start watchdog: time spent Loading (unpaused) for wdToken.
+	wdToken   string
+	wdElapsed time.Duration
+	wdToasted bool
+	scrobbled bool
+	artPath   string
+	artFor    string
+	preview   *previewState
+	dirty     atomic.Bool
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -351,25 +363,33 @@ func (p *Player) newToken(id string) string {
 	return fmt.Sprintf("%d:%s", p.tokenCtr, id)
 }
 
-func (p *Player) mediaFor(s subsonic.Song, req cache.Request, transcoded bool, prio cache.Priority, hook bool) (*audio.Media, *cache.Entry, string) {
+// mediaFor builds the engine media for s. Its download runs at prio; a
+// prepared successor is promoted to High when playback waits for it.
+func (p *Player) mediaFor(s subsonic.Song, req cache.Request, transcoded bool, prio cache.Priority) (*audio.Media, *cache.Entry, string) {
 	tok := p.newToken(s.ID)
 	hint := strings.ToLower(s.Suffix)
 	if transcoded {
 		hint = req.Format
 	}
+	dur := s.DurationTime()
 	entry := p.tracks.Get(req, prio)
-	var onWait func(bool)
-	if hook {
-		onWait = p.eng.SetBuffering
-	}
+	entry.SetDuration(dur)
+	tracks := p.tracks
 	m := audio.FromSource(tok, hint, replayGain(s), func(ctx context.Context) (audio.Source, error) {
-		e := p.tracks.Get(req, cache.High)
-		// Start playing once ~1-2 s (or the whole file) is available.
-		if err := e.Wait(ctx, 256<<10); err != nil {
+		e := tracks.Get(req, prio)
+		e.SetDuration(dur)
+		slog.Debug("player: waiting for start buffer", "id", s.ID, "token", tok)
+		// Start once a few seconds of audio (more on slow links) or the
+		// whole file are available.
+		if err := e.WaitStart(ctx); err != nil {
 			return nil, err
 		}
 		return e.Open()
-	}, onWait)
+	})
+	m.Duration = dur
+	if prio != cache.High {
+		m.Urgent = func() { tracks.Get(req, cache.High) }
+	}
 	return m, entry, tok
 }
 
@@ -383,8 +403,13 @@ func (p *Player) loadCurrentLocked(pos time.Duration, paused, transcode bool) {
 		p.dirty.Store(true)
 		return
 	}
+	if s.ID != p.retrySong {
+		p.retrySong, p.refetched, p.startRetried = s.ID, false, false
+	}
 	req, tc := p.requestFor(s, transcode)
-	m, entry, tok := p.mediaFor(s, req, tc, cache.High, true)
+	m, entry, tok := p.mediaFor(s, req, tc, cache.High)
+	p.tracks.SetCurrent(req)
+	slog.Debug("player: track requested", "id", s.ID, "title", s.Title, "token", tok, "transcode", tc)
 	p.curToken, p.curSong, p.curReq, p.curEntry, p.curTranscoded = tok, s, req, entry, tc
 	p.scrobbled = false
 	p.clearNextLocked()
@@ -412,7 +437,7 @@ func (p *Player) updateNextLocked() {
 		p.clearNextLocked()
 	} else if p.nextToken == "" || p.nextSong.ID != next.ID {
 		req, tc := p.requestFor(next, false)
-		m, entry, tok := p.mediaFor(next, req, tc, cache.Low, true)
+		m, entry, tok := p.mediaFor(next, req, tc, cache.Low)
 		p.nextToken, p.nextSong, p.nextReq, p.nextEntry = tok, next, req, entry
 		p.eng.SetNext(m)
 	}
@@ -432,6 +457,8 @@ func (p *Player) updateNextLocked() {
 func (p *Player) loop() {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
+	wd := time.NewTicker(watchdogInterval)
+	defer wd.Stop()
 	lastSave := time.Now()
 	for {
 		select {
@@ -440,6 +467,10 @@ func (p *Player) loop() {
 		case ev := <-p.eng.Events():
 			p.handleEvent(ev)
 			p.publish()
+		case <-wd.C:
+			if p.watchdog(watchdogInterval) {
+				p.publish()
+			}
 		case <-tick.C:
 			p.checkScrobble()
 			if p.dirty.Load() || (p.eng.State() == audio.Playing && time.Since(lastSave) > 15*time.Second) {
@@ -466,6 +497,9 @@ func (p *Player) handleEvent(ev audio.Event) {
 			p.q.Advance(true)
 			p.curToken, p.curSong, p.curReq, p.curEntry = p.nextToken, p.nextSong, p.nextReq, p.nextEntry
 			p.curTranscoded = p.curReq.Format != ""
+			p.retrySong, p.refetched, p.startRetried = p.curSong.ID, false, false
+			p.tracks.SetCurrent(p.curReq)
+			slog.Debug("player: gapless transition", "id", p.curSong.ID, "token", p.curToken)
 			p.nextToken = ""
 			p.scrobbled = false
 			p.failStreak = 0
@@ -500,14 +534,24 @@ func isNetworkErr(err error) bool {
 		errors.Is(err, subsonic.ErrTimeout) || strings.Contains(err.Error(), "not connected")
 }
 
+// handleErrorLocked reacts to a track error. Only errors of the current
+// track count: late errors of finished, skipped or superseded tracks and
+// errors caused by intentionally closing a track are part of the normal
+// lifecycle and only logged.
 func (p *Player) handleErrorLocked(ev audio.Event) {
+	if audio.IsTeardown(ev.Err) {
+		slog.Debug("player: ignoring teardown error", "token", ev.ID, "err", ev.Err)
+		return
+	}
 	if ev.ID == p.nextToken && ev.ID != "" {
 		// The prepared successor failed; it is retried (with transcoding if
 		// needed) when the current track ends.
+		slog.Debug("player: next track failed to prepare", "token", ev.ID, "err", ev.Err)
 		p.nextToken = ""
 		return
 	}
-	if ev.ID != p.curToken {
+	if ev.ID != p.curToken || p.curToken == "" {
+		slog.Debug("player: ignoring error of a non-current track", "token", ev.ID, "current", p.curToken, "err", ev.Err)
 		return
 	}
 	name := p.curSong.Title
@@ -515,12 +559,28 @@ func (p *Player) handleErrorLocked(ev audio.Event) {
 		p.toastLocked(true, "Playback error in “%s”: %v", name, ev.Err)
 		return
 	}
-	if !p.curTranscoded && !isNetworkErr(ev.Err) {
+	network := isNetworkErr(ev.Err)
+	if !network && !p.refetched && (p.curEntry == nil || p.curEntry.FromDisk() || p.curTranscoded) {
+		// The cached file may be truncated or corrupt: download it again
+		// once before falling back.
+		slog.Debug("player: decode failed, re-fetching", "id", p.curSong.ID, "err", ev.Err)
+		p.refetched = true
+		p.tracks.Invalidate(p.curReq)
+		p.loadCurrentLocked(p.eng.Position(), p.eng.Paused(), p.curTranscoded)
+		return
+	}
+	if !p.curTranscoded && !network {
 		// Unsupported or undecodable file: ask the server for an MP3.
+		slog.Debug("player: decode failed, transcoding", "id", p.curSong.ID, "err", ev.Err)
 		p.loadCurrentLocked(p.eng.Position(), p.eng.Paused(), true)
 		return
 	}
-	p.toastLocked(true, "Can't play “%s”: %v", name, ev.Err)
+	p.failLocked(fmt.Sprintf("Can't play “%s”: %v", name, ev.Err))
+}
+
+// failLocked reports that the current track can't be played and skips it.
+func (p *Player) failLocked(msg string) {
+	p.toastLocked(true, "%s", msg)
 	p.failStreak++
 	if p.failStreak >= p.q.Len() || p.failStreak > 20 {
 		p.failStreak = 0
@@ -529,6 +589,50 @@ func (p *Player) handleErrorLocked(ev audio.Event) {
 	if p.q.Advance(false) {
 		p.loadCurrentLocked(0, false, false)
 	}
+}
+
+const (
+	watchdogInterval = 250 * time.Millisecond
+	// slowStartNotice is when "Still loading…" is shown.
+	slowStartNotice = 3 * time.Second
+	// startTimeout is how long a track may load (unpaused) before it is
+	// retried once and then skipped.
+	startTimeout = 20 * time.Second
+)
+
+// watchdog tracks how long the current track has been loading and retries
+// or skips it when it takes too long. It reports whether state changed.
+func (p *Player) watchdog(dt time.Duration) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.preview != nil || p.curToken == "" {
+		return false
+	}
+	if p.wdToken != p.curToken {
+		p.wdToken, p.wdElapsed, p.wdToasted = p.curToken, 0, false
+	}
+	if p.eng.State() != audio.Loading || p.eng.Paused() {
+		return false
+	}
+	p.wdElapsed += dt
+	if p.wdElapsed >= slowStartNotice && !p.wdToasted {
+		p.wdToasted = true
+		p.toastLocked(false, "Still loading…")
+	}
+	if p.wdElapsed < startTimeout {
+		return false
+	}
+	if !p.startRetried {
+		slog.Debug("player: start timeout, retrying", "id", p.curSong.ID)
+		p.startRetried = true
+		tok := p.curToken
+		p.loadCurrentLocked(p.eng.Position(), false, p.curTranscoded)
+		p.wdToken, p.wdElapsed, p.wdToasted = p.curToken, 0, tok != p.curToken
+		return true
+	}
+	slog.Debug("player: start timeout, skipping", "id", p.curSong.ID)
+	p.failLocked(fmt.Sprintf("Can't play “%s”: timed out loading", p.curSong.Title))
+	return true
 }
 
 func (p *Player) nowPlayingLocked() {
@@ -606,6 +710,7 @@ func (p *Player) Snapshot() Snapshot {
 		Previewing: p.preview != nil,
 		Buffered:   1,
 	}
+	s.Loading = s.State.Waiting() && !p.eng.Paused() && p.preview == nil
 	if p.preview != nil {
 		s.Position = p.preview.pos
 		s.State = audio.Paused
@@ -658,7 +763,7 @@ func (p *Player) PlayTracks(tracks []subsonic.Song, start int, shuffle bool) {
 
 // PlayPause toggles playback.
 func (p *Player) PlayPause() {
-	if p.eng.Paused() || p.eng.State() == audio.Stopped {
+	if st := p.eng.State(); p.eng.Paused() || st == audio.Stopped || st == audio.Error {
 		p.Play()
 	} else {
 		p.Pause()
@@ -668,7 +773,7 @@ func (p *Player) PlayPause() {
 // Play resumes (or restarts) playback.
 func (p *Player) Play() {
 	p.mu.Lock()
-	if p.eng.State() == audio.Stopped && p.preview == nil {
+	if st := p.eng.State(); (st == audio.Stopped || st == audio.Error) && p.preview == nil {
 		if _, ok := p.q.Current(); ok {
 			p.loadCurrentLocked(0, false, false)
 		}
@@ -872,7 +977,7 @@ func (p *Player) StartPreview(ctx context.Context, song *subsonic.Song) error {
 		return errors.New("play a song first, or choose a different song")
 	}
 	req, tc := p.requestFor(s, false)
-	m, _, _ := p.mediaFor(s, req, tc, cache.High, false)
+	m, _, _ := p.mediaFor(s, req, tc, cache.High)
 	p.mu.Unlock()
 
 	dur := s.DurationTime()
@@ -889,7 +994,7 @@ func (p *Player) StartPreview(ctx context.Context, song *subsonic.Song) error {
 	if err != nil && !tc && ctx.Err() == nil {
 		req, tc = p.requestFor(s, true)
 		p.mu.Lock()
-		m, _, _ = p.mediaFor(s, req, tc, cache.High, false)
+		m, _, _ = p.mediaFor(s, req, tc, cache.High)
 		p.mu.Unlock()
 		pcm, err = audio.DecodeSection(ctx, m, start, length)
 	}
@@ -955,16 +1060,7 @@ func (p *Player) mprisState() (mpris.Metadata, mpris.Status) {
 			m.ArtURL = (&url.URL{Scheme: "file", Path: p.artPath}).String()
 		}
 	}
-	status := "Stopped"
-	switch p.eng.State() {
-	case audio.Playing, audio.Buffering, audio.Loading:
-		status = "Playing"
-		if p.eng.Paused() {
-			status = "Paused"
-		}
-	case audio.Paused:
-		status = "Paused"
-	}
+	status := mprisStatus(p.eng.State())
 	loop := map[queue.Repeat]string{queue.RepeatOff: "None", queue.RepeatAll: "Playlist", queue.RepeatOne: "Track"}[p.q.Repeat()]
 	has := p.q.Len() > 0
 	return m, mpris.Status{
@@ -980,11 +1076,34 @@ func (p *Player) mprisState() (mpris.Metadata, mpris.Status) {
 	}
 }
 
+// mprisStatus maps the engine state to an MPRIS PlaybackStatus. "Playing" is
+// only reported while audio is actually output; a track that is loading or
+// buffering is reported as "Paused" so that widgets never show a false
+// "playing".
+func mprisStatus(st audio.State) string {
+	switch st {
+	case audio.Playing:
+		return "Playing"
+	case audio.Paused, audio.Loading, audio.Buffering:
+		return "Paused"
+	}
+	return "Stopped"
+}
+
 type mprisAdapter struct{ p *Player }
 
-func (a mprisAdapter) Play()                   { a.p.Play() }
-func (a mprisAdapter) Pause()                  { a.p.Pause() }
-func (a mprisAdapter) PlayPause()              { a.p.PlayPause() }
+func (a mprisAdapter) Play()  { a.p.Play() }
+func (a mprisAdapter) Pause() { a.p.Pause() }
+
+// PlayPause matches what MPRIS clients display: while loading or buffering
+// they show "Paused" (and a play button), so the toggle keeps playing.
+func (a mprisAdapter) PlayPause() {
+	if a.p.eng.State() != audio.Playing && !a.p.eng.Paused() && a.p.eng.State().Waiting() {
+		a.p.Play()
+		return
+	}
+	a.p.PlayPause()
+}
 func (a mprisAdapter) Stop()                   { a.p.Stop() }
 func (a mprisAdapter) Next()                   { a.p.Next() }
 func (a mprisAdapter) Previous()               { a.p.Previous() }

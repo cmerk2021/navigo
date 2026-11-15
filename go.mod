@@ -7,6 +7,7 @@ require (
 	github.com/ebitengine/oto/v3 v3.5.1
 	github.com/godbus/dbus/v5 v5.2.4
 	github.com/hajimehoshi/go-mp3 v0.3.4
+	github.com/jezek/xgb v1.1.1
 	github.com/jfreymuth/oggvorbis v1.0.5
 	github.com/mewkiz/flac v1.0.14
 )

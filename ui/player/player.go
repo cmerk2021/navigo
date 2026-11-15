@@ -67,6 +67,7 @@ type View struct {
 	// Hover controls.
 	hoverTag  int
 	hovering  bool
+	loading   bool
 	lastMove  time.Time
 	ctrlAlpha float32
 	lastFrame time.Time
@@ -168,7 +169,7 @@ func (v *View) controlsAlpha(gtx layout.Context) float32 {
 		dt = float32(gtx.Now.Sub(v.lastFrame)) / float32(fadeDuration)
 	}
 	v.lastFrame = gtx.Now
-	visible := !v.sh.OverlayOpen() && ((v.hovering && gtx.Now.Sub(v.lastMove) < hideDelay) || v.seek.Dragging())
+	visible := !v.sh.OverlayOpen() && ((v.hovering && gtx.Now.Sub(v.lastMove) < hideDelay) || v.seek.Dragging() || v.loading)
 	target := float32(0)
 	if visible {
 		target = 1
@@ -204,8 +205,10 @@ func songText(s core.Snapshot) (string, string) {
 	return s.Song.Title, artist
 }
 
+// playing reports whether playback is wanted (the play button shows pause).
+// While loading or buffering the button shows a spinner as well.
 func playing(s core.Snapshot) bool {
-	return s.State == audio.Playing || s.State == audio.Loading || s.State == audio.Buffering
+	return s.State == audio.Playing || s.Loading
 }
 
 // LayoutNormal draws the 370×370 view.
@@ -240,6 +243,8 @@ func (v *View) LayoutNormal(gtx layout.Context, s core.Snapshot) {
 	v.updateArt(gtx, s)
 	v.drawArt(gtx, full, rad, s)
 
+	// Controls stay visible while loading so the spinner can be seen.
+	v.loading = s.Loading
 	alpha := v.controlsAlpha(gtx)
 	{
 		cl := clip.UniformRRect(full, rad).Push(gtx.Ops)
@@ -303,6 +308,7 @@ func (v *View) layoutControls(gtx layout.Context, s core.Snapshot) {
 	g := gtx
 	g.Constraints = layout.Constraints{Max: image.Pt(sz.X-2*sx, hit)}
 	widgets.Off(g, image.Pt(sx, sy), func(gtx layout.Context) layout.Dimensions {
+		v.seek.Loading = s.Loading
 		if t, ok := v.seek.Layout(gtx, th, s.Position, s.Duration, s.Buffered); ok {
 			v.e.Player.SeekTo(t)
 		}
@@ -351,7 +357,11 @@ func (v *View) layoutControls(gtx layout.Context, s core.Snapshot) {
 	if playing(s) {
 		pic = theme.IconPause
 	}
+	px := x
 	btn(&v.playBtn, play, pic, widgets.StyleGlass, 0.48)
+	if s.Loading {
+		theme.Spinner(gtx, theme.Rect(px, cy-play/2, play, play), float32(gtx.Dp(2.5)), theme.White)
+	}
 	btn(&v.nextBtn, skip, theme.IconNext, widgets.StyleGlass, 0.46)
 	sstyle := widgets.StyleGlass
 	if s.Shuffle {
@@ -406,6 +416,9 @@ func (v *View) LayoutCompact(gtx layout.Context, s core.Snapshot) {
 		pic = theme.IconPause
 	}
 	btn(&v.cPlay, ps, pic, 0.5)
+	if s.Loading {
+		theme.Spinner(gtx, theme.Rect(x+gap, cy-ps/2, ps, ps), float32(gtx.Dp(2)), theme.White)
+	}
 	btn(&v.cPrev, bs, theme.IconPrev, 0.46)
 
 	inset := (h - gtx.Dp(theme.CompactThumb) - 2*gtx.Dp(theme.CompactInnerPad)) / 2

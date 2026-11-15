@@ -26,6 +26,7 @@ import (
 	"github.com/cmerk2021/navigo/internal/config"
 	"github.com/cmerk2021/navigo/internal/core"
 	"github.com/cmerk2021/navigo/internal/kde"
+	"github.com/cmerk2021/navigo/internal/winpos"
 	"github.com/cmerk2021/navigo/ui/env"
 	"github.com/cmerk2021/navigo/ui/eq"
 	"github.com/cmerk2021/navigo/ui/eqassist"
@@ -138,6 +139,22 @@ type App struct {
 	wantH    unit.Dp
 	sizeReq  time.Time
 	checked  bool
+	// lockedH is the height the Gio size constraints are pinned to.
+	lockedH unit.Dp
+
+	// Window placement (see placement.go). placer is nil while probing.
+	plmu       sync.Mutex
+	placer     winpos.Placer
+	kwinProbed chan struct{}
+	placeCh    chan placeReq
+	frameCh    chan struct{}
+	placeGen   int
+	placeBusy  bool
+	viewSeen   bool
+	// growUp lays the window out bottom-anchored: it was expanded upward,
+	// so the player stays where it was on screen and the menu/panel
+	// appears above it.
+	growUp bool
 
 	// Windows; wmu guards main/aux pointers for Invalidate from any goroutine.
 	wmu     sync.Mutex
@@ -166,6 +183,10 @@ func Run(cfg *config.Config) {
 		panels: map[env.Kind]env.Panel{},
 		mode:   cfg.Mode,
 		cfg:    cfg.Clone(),
+
+		kwinProbed: make(chan struct{}),
+		placeCh:    make(chan placeReq, 1),
+		frameCh:    make(chan struct{}, 1),
 	}
 	a.env = &env.Env{
 		Player:     a.p,
@@ -174,6 +195,7 @@ func Run(cfg *config.Config) {
 		Open:       func(k env.Kind) { a.request(func() { a.setPanel(k) }) },
 		Close:      func() { a.request(func() { a.setPanel(env.None) }) },
 		Toast:      a.toast,
+		Placement:  a.PlacementName,
 	}
 	a.menu = menu.New(a.env, a)
 	a.main = newWin(auxNone)
@@ -184,6 +206,9 @@ func Run(cfg *config.Config) {
 	}
 
 	a.wantH = a.modeHeight()
+	a.lockedH = a.wantH
+	go a.probeKWin()
+	go a.placeWorker()
 	opts := append([]gioapp.Option{gioapp.Title("Navigo"), gioapp.Decorated(false), gioapp.Transparent(true)}, sizeOpts(a.wantH)...)
 	a.main.w.Option(opts...)
 
@@ -320,7 +345,15 @@ func (a *App) savePosition() {
 }
 
 // separate reports whether panels/menus use their own window.
-func (a *App) separate() bool { return a.fallback || a.cfg.PanelsSeparateWindow }
+func (a *App) separate() bool {
+	if a.fallback || a.cfg.PanelsSeparateWindow {
+		return true
+	}
+	// Without a way to position the window it can't grow away from a
+	// screen edge; let the compositor place separate windows instead.
+	p := a.getPlacer()
+	return p != nil && !p.Available()
+}
 
 func (a *App) modeHeight() unit.Dp {
 	if a.mode == config.ModeCompact {
@@ -459,7 +492,8 @@ func (a *App) syncAux() {
 			ws.moveTo, ws.hasMove = image.Pt(x, y), true
 		}
 	}
-	title := "Navigo"
+	// Distinct from the main window's title, which KWin placement matches.
+	title := "Navigo panel"
 	if want == auxMenu {
 		title = "Navigo menu"
 	}
@@ -482,6 +516,10 @@ func (a *App) loop(ws *winState) {
 	for {
 		switch e := ws.w.Event().(type) {
 		case gioapp.X11ViewEvent:
+			if e.Valid() && ws.kind == auxNone && !a.viewSeen {
+				a.viewSeen = true
+				go a.selectX11(uint32(e.Window))
+			}
 			if e.Valid() && ws.x11 == nil {
 				ws.x11 = x11win.Attach(uintptr(e.Window))
 				if ws.x11 != nil {
@@ -490,6 +528,11 @@ func (a *App) loop(ws *winState) {
 						ws.x11.Move(ws.moveTo.X, ws.moveTo.Y)
 					}
 				}
+			}
+		case gioapp.WaylandViewEvent:
+			if e.Valid() && ws.kind == auxNone && !a.viewSeen {
+				a.viewSeen = true
+				go a.selectWayland()
 			}
 		case gioapp.ConfigEvent:
 			ws.focused = e.Config.Focused
@@ -504,6 +547,9 @@ func (a *App) loop(ws *winState) {
 			}
 			a.mu.Unlock()
 			e.Frame(gtx.Ops)
+			if ws.kind == auxNone {
+				a.signalFrame()
+			}
 		case gioapp.DestroyEvent:
 			close(ws.done)
 			if ws.x11 != nil {
@@ -563,20 +609,25 @@ func (a *App) frameMain(gtx layout.Context) {
 	h := a.desiredHeight()
 	if h != a.wantH {
 		a.wantH, a.sizeReq, a.checked = h, gtx.Now, false
-		opts := sizeOpts(h)
-		ws.async(func() { ws.w.Option(opts...) })
-		theme.RedrawAt(gtx, gtx.Now.Add(verifyDelay+50*time.Millisecond))
-	}
-	if !a.checked && gtx.Now.Sub(a.sizeReq) >= verifyDelay {
-		a.checked = true
-		if d := gtx.Constraints.Max.Y - gtx.Dp(a.wantH); (d > 2 || d < -2) && a.wantH > a.modeHeight() {
-			a.fallback = true
+		if a.usePlacer() {
+			a.postPlace(h, a.modeHeight())
+		} else {
+			a.lockSize(ws, h)
 		}
-		if a.fallback {
-			if h := a.desiredHeight(); h != a.wantH {
-				a.wantH, a.sizeReq, a.checked = h, gtx.Now, true
-				opts := sizeOpts(h)
-				ws.async(func() { ws.w.Option(opts...) })
+	}
+	if !a.checked && !a.placeBusy {
+		if gtx.Now.Sub(a.sizeReq) < verifyDelay {
+			theme.RedrawAt(gtx, a.sizeReq.Add(verifyDelay+50*time.Millisecond))
+		} else {
+			a.checked = true
+			if d := gtx.Constraints.Max.Y - gtx.Dp(a.wantH); (d > 2 || d < -2) && a.wantH > a.modeHeight() {
+				a.fallback = true
+			}
+			if a.fallback {
+				if h := a.desiredHeight(); h != a.wantH {
+					a.wantH, a.sizeReq, a.checked = h, gtx.Now, true
+					a.lockSize(ws, h)
+				}
 			}
 		}
 	}
@@ -587,20 +638,39 @@ func (a *App) frameMain(gtx layout.Context) {
 
 	if a.panelKind != env.None && !sep {
 		a.layoutPanel(gtx, image.Pt(gtx.Dp(theme.WindowWidth), gtx.Dp(theme.PanelHeight)))
-	} else if a.mode == config.ModeCompact {
-		a.withSize(gtx, image.Pt(gtx.Dp(theme.WindowWidth), gtx.Dp(theme.CompactHeight)), func(gtx layout.Context) {
-			a.view.LayoutCompact(gtx, s)
-		})
 	} else {
-		a.withSize(gtx, image.Pt(gtx.Dp(theme.WindowWidth), gtx.Dp(theme.NormalHeight)), func(gtx layout.Context) {
-			a.view.LayoutNormal(gtx, s)
-		})
+		// When grown upward, the player sits at the bottom so it stays put
+		// on screen while the window above it grows or shrinks.
+		mh := gtx.Dp(a.modeHeight())
+		var off image.Point
+		if a.growUp {
+			off.Y = max(gtx.Constraints.Max.Y-mh, 0)
+		}
+		st := op.Offset(off).Push(gtx.Ops)
+		if a.mode == config.ModeCompact {
+			a.withSize(gtx, image.Pt(gtx.Dp(theme.WindowWidth), mh), func(gtx layout.Context) {
+				a.view.LayoutCompact(gtx, s)
+			})
+		} else {
+			a.withSize(gtx, image.Pt(gtx.Dp(theme.WindowWidth), mh), func(gtx layout.Context) {
+				a.view.LayoutNormal(gtx, s)
+			})
+		}
+		st.Pop()
 	}
 
 	if a.menuOpen && a.panelKind == env.None && !(sep && a.mode == config.ModeCompact) {
 		a.layoutMenuInWindow(gtx)
 	}
 	a.syncAux()
+}
+
+// lockSize pins the main window to height h through Gio alone (the window
+// grows/shrinks at its bottom edge).
+func (a *App) lockSize(ws *winState, h unit.Dp) {
+	a.lockedH = h
+	opts := sizeOpts(h)
+	ws.async(func() { ws.w.Option(opts...) })
 }
 
 // paintBase fills the window background on X11, where Gio has no
@@ -656,17 +726,27 @@ func (a *App) layoutMenuInWindow(gtx layout.Context) {
 	var pos image.Point
 	if a.mode == config.ModeCompact {
 		pos = image.Pt(gtx.Dp(theme.WindowWidth)-margin-msz.X, gtx.Dp(theme.CompactHeight)+margin)
+		if a.growUp {
+			// The window grew upward: the bar is at the bottom and the menu
+			// opens above it, away from the screen edge.
+			pos.Y = max(full.Dy()-gtx.Dp(theme.CompactHeight)-margin-msz.Y, margin)
+		}
 		if a.menuAnchor.X < gtx.Dp(theme.WindowWidth)/2 {
 			pos.X = margin
 		}
 	} else {
 		pos = a.menuAnchor
+		top := 0
+		if a.growUp {
+			// Keep the menu over the player, which sits at the bottom.
+			top = max(full.Dy()-gtx.Dp(theme.NormalHeight), 0)
+		}
 		if pos.X > full.Dx()/2 {
 			pos.X -= msz.X
 		}
 		h := gtx.Dp(theme.NormalHeight)
 		pos.X = clampInt(pos.X, margin, full.Dx()-margin-msz.X)
-		pos.Y = clampInt(pos.Y, margin, h-margin-msz.Y)
+		pos.Y = clampInt(pos.Y, top+margin, top+h-margin-msz.Y)
 	}
 	defer op.Offset(pos).Push(gtx.Ops).Pop()
 	mg := gtx

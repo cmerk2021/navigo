@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 
 	gioapp "gioui.org/app"
@@ -37,6 +38,11 @@ Usage:
 `
 
 func main() {
+	if os.Getenv("NAVIGO_DEBUG") != "" {
+		// Traces the track lifecycle (requested → downloading → decoder
+		// opened → first samples → playing), retries and window placement.
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+	}
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 

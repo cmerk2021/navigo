@@ -487,6 +487,13 @@ func (p *Panel) Layout(gtx layout.Context) layout.Dimensions {
 
 		heading("Windows"),
 		toggleRow("Open panels in separate window", "Use if your compositor ignores size changes", &p.separate, c.PanelsSeparateWindow, func(c *config.Config, v bool) { c.PanelsSeparateWindow = v }),
+		func(gtx layout.Context) layout.Dimensions {
+			name := "unavailable"
+			if p.e.Placement != nil {
+				name = p.e.Placement()
+			}
+			return th.Text(gtx, "Window placement: "+name, theme.SmallSize, font.Normal, theme.TextTertiary)
+		},
 		space(14),
 		func(gtx layout.Context) layout.Dimensions {
 			bh := gtx.Dp(theme.PillButtonHeight)

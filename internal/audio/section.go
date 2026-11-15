@@ -99,10 +99,10 @@ func (l *loopDec) Length() int64 { return -1 }
 func (l *loopDec) Close() error  { return nil }
 
 // FromSource builds a Media whose decoder reads from the Source returned by
-// open. Blocking reads are aborted when ctx is cancelled. If the source has a
-// SetWaitHook method, onWait is installed once the decoder is open, so that
-// stalls during playback (not while pre-opening) are reported.
-func FromSource(id, hint string, rg ReplayGain, open func(ctx context.Context) (Source, error), onWait func(bool)) *Media {
+// open. Blocking reads are aborted when ctx is cancelled. The engine
+// installs a wait hook on sources that implement SetWaitHook to detect
+// stalls of the current track.
+func FromSource(id, hint string, rg ReplayGain, open func(ctx context.Context) (Source, error)) *Media {
 	return &Media{
 		ID:         id,
 		ReplayGain: rg,
@@ -118,12 +118,64 @@ func FromSource(id, hint string, rg ReplayGain, open func(ctx context.Context) (
 				src.Close()
 				return nil, err
 			}
-			if h, ok := src.(interface{ SetWaitHook(func(bool)) }); ok && onWait != nil {
-				h.SetWaitHook(onWait)
-			}
-			return dec, nil
+			return &srcDecoder{Decoder: dec, src: src}, nil
 		},
 	}
+}
+
+// srcDecoder wraps a decoder reading from a Source. Once the decoder has
+// returned io.EOF it is never read again, and it reports whether the
+// source has been consumed (so that errors there count as the end).
+type srcDecoder struct {
+	Decoder
+	src Source
+	eof bool
+}
+
+func (d *srcDecoder) Read(dst []float32) (int, error) {
+	if d.eof {
+		return 0, io.EOF
+	}
+	n, err := d.Decoder.Read(dst)
+	if err == io.EOF {
+		d.eof = true
+	}
+	return n, err
+}
+
+func (d *srcDecoder) SeekFrame(f int64) error {
+	d.eof = false
+	return d.Decoder.SeekFrame(f)
+}
+
+func (d *srcDecoder) Interrupt() { d.src.Interrupt() }
+
+func (d *srcDecoder) ReplayGain() ReplayGain {
+	if t, ok := d.Decoder.(tagged); ok {
+		return t.ReplayGain()
+	}
+	return ReplayGain{}
+}
+
+func (d *srcDecoder) SetWaitHook(h func(bool)) {
+	if s, ok := d.src.(waitHooker); ok {
+		s.SetWaitHook(h)
+	}
+}
+
+// atEnd reports whether the (completely downloaded) source has been read
+// to within the last 1% / 64 KiB.
+func (d *srcDecoder) atEnd() bool {
+	sz, ok := d.src.(interface{ Size() int64 })
+	if !ok || !d.src.Complete() {
+		return false
+	}
+	size := sz.Size()
+	pos, err := d.src.Seek(0, io.SeekCurrent)
+	if err != nil || size <= 0 {
+		return false
+	}
+	return size-pos <= max(64<<10, size/100)
 }
 
 // MemSource is an in-memory Source (used for tests and previews).
