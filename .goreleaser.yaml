@@ -1,0 +1,80 @@
+# GoReleaser configuration for Navigo.
+# Validate with: goreleaser check
+# Local snapshot: make snapshot
+version: 2
+
+project_name: navigo
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: navigo
+    main: ./cmd/navigo
+    binary: navigo
+    goos:
+      - linux
+    goarch:
+      - amd64
+      # arm64 is disabled: Gio needs cgo (Wayland/X11/EGL/Vulkan headers),
+      # so cross-compiling from an amd64 runner requires an aarch64 C
+      # toolchain plus arm64 system libraries (e.g. goreleaser-cross).
+      # Enable it when building on a native arm64 runner (ubuntu-24.04-arm).
+      # - arm64
+    env:
+      - CGO_ENABLED=1
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "navigo_{{ .Version }}_linux_{{ .Arch }}"
+    wrap_in_directory: false
+    files:
+      - README.md
+      - LICENSE
+      - THIRD_PARTY_LICENSES.md
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: git
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Performance
+      regexp: '^.*?perf(\(.+\))??!?:.+$'
+      order: 2
+    - title: Refactors
+      regexp: '^.*?refactor(\(.+\))??!?:.+$'
+      order: 3
+    - title: Documentation
+      regexp: '^.*?docs(\(.+\))??!?:.+$'
+      order: 4
+    - title: Others
+      order: 999
+  filters:
+    exclude:
+      - '^test:'
+      - '^chore\(deps\)'
+      - '^Merge pull request'
+      - '^Merge branch'
+      - '^Merge remote-tracking branch'
+
+release:
+  github:
+    owner: cmerk2021
+    name: navigo
+  prerelease: auto
