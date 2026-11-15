@@ -118,9 +118,17 @@ type flacDec struct {
 	scale  float32
 	rate   int
 	length int64
+	rg     ReplayGain
 }
 
 func newFLAC(src Source) (Decoder, error) {
+	var rg ReplayGain
+	if start, err := skipID3(src); err == nil {
+		rg = readFLACReplayGain(src, start)
+	}
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
 	s, err := flac.NewSeek(src)
 	if err != nil {
 		return nil, fmt.Errorf("flac: %w", err)
@@ -133,13 +141,14 @@ func newFLAC(src Source) (Decoder, error) {
 	if length == 0 {
 		length = -1
 	}
-	return &flacDec{src: src, s: s, scale: 1 / float32(int64(1)<<(bps-1)), rate: int(s.Info.SampleRate), length: length}, nil
+	return &flacDec{src: src, s: s, scale: 1 / float32(int64(1)<<(bps-1)), rate: int(s.Info.SampleRate), length: length, rg: rg}, nil
 }
 
-func (d *flacDec) SampleRate() int { return d.rate }
-func (d *flacDec) Length() int64   { return d.length }
-func (d *flacDec) Interrupt()      { d.src.Interrupt() }
-func (d *flacDec) Close() error    { return d.src.Close() }
+func (d *flacDec) ReplayGain() ReplayGain { return d.rg }
+func (d *flacDec) SampleRate() int        { return d.rate }
+func (d *flacDec) Length() int64          { return d.length }
+func (d *flacDec) Interrupt()             { d.src.Interrupt() }
+func (d *flacDec) Close() error           { return d.src.Close() }
 
 func (d *flacDec) Read(dst []float32) (int, error) {
 	for len(d.pend) == 0 {
@@ -201,6 +210,7 @@ type vorbisDec struct {
 	seekable bool
 	ch       int
 	buf      []float32
+	rg       ReplayGain
 }
 
 func newVorbis(src Source) (Decoder, error) {
@@ -224,12 +234,14 @@ func (d *vorbisDec) open(seekable bool) error {
 		return fmt.Errorf("ogg: %w", err)
 	}
 	d.r, d.seekable, d.ch = r, seekable, r.Channels()
+	d.rg = parseVorbisComments(r.CommentHeader().Comments)
 	return nil
 }
 
-func (d *vorbisDec) SampleRate() int { return d.r.SampleRate() }
-func (d *vorbisDec) Interrupt()      { d.src.Interrupt() }
-func (d *vorbisDec) Close() error    { return d.src.Close() }
+func (d *vorbisDec) ReplayGain() ReplayGain { return d.rg }
+func (d *vorbisDec) SampleRate() int        { return d.r.SampleRate() }
+func (d *vorbisDec) Interrupt()             { d.src.Interrupt() }
+func (d *vorbisDec) Close() error           { return d.src.Close() }
 
 func (d *vorbisDec) Length() int64 {
 	if d.seekable && d.r.Length() > 0 {
@@ -449,10 +461,11 @@ type mp3Dec struct {
 	scanSamples int64
 	scanDone    bool
 	dataStart   int64
+	rg          ReplayGain
 }
 
 func newMP3(src Source) (Decoder, error) {
-	d := &mp3Dec{src: src}
+	d := &mp3Dec{src: src, rg: readID3ReplayGain(src)}
 	start, err := skipID3(src)
 	if err != nil {
 		return nil, err
@@ -487,10 +500,11 @@ func skipID3(r io.ReadSeeker) (int64, error) {
 	return n, nil
 }
 
-func (d *mp3Dec) SampleRate() int { return d.rate }
-func (d *mp3Dec) Length() int64   { return -1 }
-func (d *mp3Dec) Interrupt()      { d.src.Interrupt() }
-func (d *mp3Dec) Close() error    { return d.src.Close() }
+func (d *mp3Dec) ReplayGain() ReplayGain { return d.rg }
+func (d *mp3Dec) SampleRate() int        { return d.rate }
+func (d *mp3Dec) Length() int64          { return -1 }
+func (d *mp3Dec) Interrupt()             { d.src.Interrupt() }
+func (d *mp3Dec) Close() error           { return d.src.Close() }
 
 func (d *mp3Dec) Read(dst []float32) (int, error) {
 	frames := len(dst) / 2

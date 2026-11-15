@@ -11,6 +11,7 @@ import (
 	"gioui.org/io/event"
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
+	"gioui.org/op"
 	"gioui.org/op/clip"
 	"gioui.org/text"
 	"gioui.org/widget"
@@ -312,6 +313,115 @@ func (s *SelectList) Layout(gtx layout.Context, th *theme.Theme, items []string,
 		})
 	})
 	return clicked
+}
+
+// Dropdown is a pill button that opens a list of choices below it. The list
+// is drawn with op.Defer so it appears above later content and escapes
+// scroll-list clipping.
+type Dropdown struct {
+	// Up opens the list above the button instead of below it.
+	Up    bool
+	btn   widget.Clickable
+	open  bool
+	scrim bool // event tag
+	card  bool // event tag
+	list  SelectList
+}
+
+// DropdownListHeight returns the height of the list card for n items,
+// including the gap to the button.
+func DropdownListHeight(gtx layout.Context, n int) int {
+	return min(n, theme.DropdownMaxItems)*gtx.Dp(theme.DropdownItemH) + 2*gtx.Dp(6) + gtx.Dp(6)
+}
+
+// Close closes the list and reports whether it was open.
+func (d *Dropdown) Close() bool {
+	was := d.open
+	d.open = false
+	return was
+}
+
+// Layout draws the button in gtx.Constraints.Min and updates *sel. It
+// reports whether the selection changed.
+func (d *Dropdown) Layout(gtx layout.Context, th *theme.Theme, opts []string, sel *int) bool {
+	for d.btn.Clicked(gtx) {
+		d.open = !d.open
+	}
+	for {
+		ev, ok := gtx.Event(pointer.Filter{Target: &d.scrim, Kinds: pointer.Press})
+		if !ok {
+			break
+		}
+		if e, ok := ev.(pointer.Event); ok && e.Kind == pointer.Press {
+			d.open = false
+		}
+	}
+	for {
+		if _, ok := gtx.Event(pointer.Filter{Target: &d.card, Kinds: pointer.Press}); !ok {
+			break
+		}
+	}
+	sz := gtx.Constraints.Min
+	label := ""
+	if *sel >= 0 && *sel < len(opts) {
+		label = opts[*sel]
+	}
+	is := gtx.Dp(18)
+	d.btn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		r := image.Rectangle{Max: sz}
+		theme.FillPill(gtx.Ops, r, theme.FieldBG)
+		if d.btn.Hovered() || d.open {
+			theme.FillPill(gtx.Ops, r, theme.GlassHover)
+		}
+		theme.BoxLoose(gtx, image.Rect(gtx.Dp(14), 0, r.Dx()-gtx.Dp(14+6)-is, r.Dy()), func(gtx layout.Context) layout.Dimensions {
+			gtx.Constraints.Min.Y = gtx.Constraints.Max.Y
+			return theme.W(gtx, func(gtx layout.Context) layout.Dimensions {
+				return th.Text(gtx, label, theme.BodySize, font.SemiBold, theme.White)
+			})
+		})
+		theme.DrawIcon(gtx.Ops, theme.IconChevronDown, theme.Rect(r.Dx()-gtx.Dp(12)-is, (r.Dy()-is)/2, is, is), theme.TextSecondary)
+		defer clip.Rect(r).Push(gtx.Ops).Pop()
+		pointer.CursorPointer.Add(gtx.Ops)
+		return layout.Dimensions{Size: sz}
+	})
+	changed := false
+	if !d.open {
+		return false
+	}
+
+	m := op.Record(gtx.Ops)
+	// Scrim: a press anywhere outside the card closes the list.
+	big := gtx.Dp(10000)
+	sc := clip.Rect{Min: image.Pt(-big, -big), Max: image.Pt(big, big)}.Push(gtx.Ops)
+	event.Op(gtx.Ops, &d.scrim)
+	sc.Pop()
+	ih := gtx.Dp(theme.DropdownItemH)
+	vpad := gtx.Dp(6)
+	listH := min(len(opts), theme.DropdownMaxItems) * ih
+	card := image.Rect(0, sz.Y+gtx.Dp(6), sz.X, sz.Y+gtx.Dp(6)+listH+2*vpad)
+	if d.Up {
+		card = image.Rect(0, -gtx.Dp(6)-listH-2*vpad, sz.X, -gtx.Dp(6))
+	}
+	rad := gtx.Dp(theme.MenuRadius)
+	area := clip.UniformRRect(card, rad).Push(gtx.Ops)
+	event.Op(gtx.Ops, &d.card)
+	area.Pop()
+	theme.FillRRect(gtx.Ops, card, rad, theme.MenuBG)
+	theme.StrokeRRect(gtx.Ops, card, rad, float32(gtx.Dp(1)), color.NRGBA{R: 255, G: 255, B: 255, A: 24})
+	listR := image.Rect(card.Min.X+vpad, card.Min.Y+vpad, card.Max.X-vpad, card.Max.Y-vpad)
+	theme.Box(gtx, listR, func(gtx layout.Context) layout.Dimensions {
+		defer clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops).Pop()
+		if i := d.list.Layout(gtx, th, opts, *sel); i >= 0 {
+			d.open = false
+			if i != *sel {
+				*sel = i
+				changed = true
+			}
+		}
+		return layout.Dimensions{Size: gtx.Constraints.Max}
+	})
+	op.Defer(gtx.Ops, m.Stop())
+	return changed
 }
 
 // Toasts shows short transient messages.

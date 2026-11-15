@@ -74,8 +74,9 @@ type Event struct {
 // Media describes a playable item.
 type Media struct {
 	ID string
-	// Gain is a linear ReplayGain factor (0 means 1).
-	Gain float32
+	// ReplayGain holds server-reported values; values missing here are
+	// taken from the file's tags.
+	ReplayGain ReplayGain
 	// Open returns a decoder positioned at the start. It may block until data
 	// is available and must honour ctx cancellation.
 	Open func(ctx context.Context) (Decoder, error)
@@ -99,6 +100,7 @@ type track struct {
 	seq   int64
 	pos   int64 // frames produced (output rate)
 	auto  bool
+	rg    ReplayGain // server values merged with file tags
 }
 
 func (t *track) read(dst []float32) (int, error) {
@@ -146,6 +148,7 @@ type Engine struct {
 	paused atomic.Bool
 	volume atomic.Uint64 // float64 bits
 	muted  atomic.Bool
+	rgMode atomic.Int32 // ReplayGainMode
 
 	// position of the audio currently heard
 	posFrames atomic.Int64
@@ -240,6 +243,13 @@ func (e *Engine) SetMuted(m bool) { e.muted.Store(m) }
 
 // Muted reports the mute state.
 func (e *Engine) Muted() bool { return e.muted.Load() }
+
+// SetReplayGainMode selects the ReplayGain value applied to decoded audio.
+// The change takes effect for audio decoded from now on.
+func (e *Engine) SetReplayGainMode(m ReplayGainMode) { e.rgMode.Store(int32(m)) }
+
+// ReplayGainMode returns the ReplayGain mode.
+func (e *Engine) ReplayGainMode() ReplayGainMode { return ReplayGainMode(e.rgMode.Load()) }
 
 func (e *Engine) interruptWorker() {
 	e.mu.Lock()
@@ -535,7 +545,7 @@ func (w *workerState) handle(c command) {
 				// Superseded by a newer command which will reopen/replace.
 				if w.cur == cur {
 					cur.close()
-					w.cur = &track{media: cur.media, dec: closedDecoder{}, seq: cur.seq, auto: cur.auto, pos: c.pos}
+					w.cur = &track{media: cur.media, dec: closedDecoder{}, seq: cur.seq, auto: cur.auto, pos: c.pos, rg: cur.rg}
 				}
 				return
 			}
@@ -659,7 +669,7 @@ func (w *workerState) produce() *chunk {
 	buf := make([]float32, chunkFrames*2)
 	n, err := cur.read(buf)
 	if n > 0 {
-		c := &chunk{gen: gen, seq: cur.seq, id: cur.media.ID, auto: cur.auto, start: cur.pos, gain: gainOf(cur.media), samples: buf[:n*2]}
+		c := &chunk{gen: gen, seq: cur.seq, id: cur.media.ID, auto: cur.auto, start: cur.pos, gain: cur.rg.Factor(e.ReplayGainMode()), samples: buf[:n*2]}
 		cur.pos += int64(n)
 		return c
 	}
@@ -686,13 +696,6 @@ func (w *workerState) produce() *chunk {
 	return nil
 }
 
-func gainOf(m *Media) float32 {
-	if m.Gain <= 0 {
-		return 1
-	}
-	return m.Gain
-}
-
 // openTrack opens a media item and seeks to pos (output-rate frames).
 func (e *Engine) openTrack(ctx context.Context, m *Media, pos int64) (*track, error) {
 	dec, err := m.Open(ctx)
@@ -707,7 +710,10 @@ func (e *Engine) openTrack(ctx context.Context, m *Media, pos int64) (*track, er
 		dec.Close()
 		return nil, errors.New("invalid sample rate")
 	}
-	t := &track{media: m, dec: dec}
+	t := &track{media: m, dec: dec, rg: m.ReplayGain}
+	if tg, ok := dec.(tagged); ok {
+		t.rg = t.rg.Merge(tg.ReplayGain())
+	}
 	if dec.SampleRate() != SampleRate {
 		t.rs = newResampler(dec, SampleRate)
 	}
