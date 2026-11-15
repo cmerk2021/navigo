@@ -13,12 +13,11 @@ import (
 	"github.com/cmerk2021/navigo/ui/theme"
 )
 
-// PanelBackground paints the dark panel card over the whole constraint area
-// and installs a window-move area behind the content.
+// PanelBackground paints the rounded dark panel card over the whole
+// constraint area (the corners stay transparent) and installs a window-move area behind the content.
 func PanelBackground(gtx layout.Context, drag *DragArea) {
 	sz := gtx.Constraints.Max
 	r := image.Rectangle{Max: sz}
-	theme.FillRect(gtx.Ops, r, theme.WindowBG)
 	theme.FillRRect(gtx.Ops, r, gtx.Dp(theme.PanelRadius), theme.PanelBG)
 	if drag != nil {
 		drag.Layout(gtx, r)

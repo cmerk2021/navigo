@@ -184,7 +184,7 @@ func Run(cfg *config.Config) {
 	}
 
 	a.wantH = a.modeHeight()
-	opts := append([]gioapp.Option{gioapp.Title("Navigo"), gioapp.Decorated(false)}, sizeOpts(a.wantH)...)
+	opts := append([]gioapp.Option{gioapp.Title("Navigo"), gioapp.Decorated(false), gioapp.Transparent(true)}, sizeOpts(a.wantH)...)
 	a.main.w.Option(opts...)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -463,7 +463,7 @@ func (a *App) syncAux() {
 	if want == auxMenu {
 		title = "Navigo menu"
 	}
-	ws.w.Option(gioapp.Title(title), gioapp.Decorated(false), gioapp.MaxSize(w, h), gioapp.Size(w, h), gioapp.MinSize(w, h))
+	ws.w.Option(gioapp.Title(title), gioapp.Decorated(false), gioapp.Transparent(true), gioapp.MaxSize(w, h), gioapp.Size(w, h), gioapp.MinSize(w, h))
 	a.wmu.Lock()
 	a.aux = ws
 	a.wmu.Unlock()
@@ -581,8 +581,7 @@ func (a *App) frameMain(gtx layout.Context) {
 		}
 	}
 
-	full := image.Rectangle{Max: gtx.Constraints.Max}
-	theme.FillRect(gtx.Ops, full, theme.WindowBG)
+	paintBase(gtx, ws)
 	s := a.p.Snapshot()
 	sep := a.separate()
 
@@ -602,6 +601,15 @@ func (a *App) frameMain(gtx layout.Context) {
 		a.layoutMenuInWindow(gtx)
 	}
 	a.syncAux()
+}
+
+// paintBase fills the window background on X11, where Gio has no
+// transparent window surface. Elsewhere (Wayland) the area outside the
+// rounded shapes stays transparent.
+func paintBase(gtx layout.Context, ws *winState) {
+	if ws.x11 != nil {
+		theme.FillRect(gtx.Ops, image.Rectangle{Max: gtx.Constraints.Max}, theme.WindowBG)
+	}
 }
 
 func (a *App) withSize(gtx layout.Context, sz image.Point, f func(gtx layout.Context)) {
@@ -686,7 +694,7 @@ func clampInt(v, lo, hi int) int {
 func (a *App) frameAux(gtx layout.Context, ws *winState) {
 	a.beginFrame(gtx, ws)
 	full := image.Rectangle{Max: gtx.Constraints.Max}
-	theme.FillRect(gtx.Ops, full, theme.WindowBG)
+	paintBase(gtx, ws)
 	if a.aux != ws {
 		return
 	}

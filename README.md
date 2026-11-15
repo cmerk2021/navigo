@@ -264,10 +264,22 @@ toolchain and arm64 system libraries, so either:
 
 ## Known limitations and fallbacks
 
-* **Transparency / rounded corners:** Gio does not expose transparent window
-  surfaces, so the window is painted with a solid near-black background
-  (`#0E0E10`). The rounded card is drawn on top of it, which means the
-  corners are dark rather than see-through.
+* **Patched Gio:** Navigo builds against Gio v0.10.3 vendored in
+  [`third_party/gio`](third_party/gio) (via a `replace` in `go.mod`). The
+  changes are marked `navigo patch` in the source:
+  * a `Transparent` window option (transparent clear color, no Wayland opaque
+    region, EGL config with alpha),
+  * on Wayland, undecorated windows explicitly request client-side
+    decorations through `xdg-decoration` (otherwise KWin adds its own title
+    bar) and reserve no space for fallback decorations,
+  * on Wayland, size changes made by the application resize the GPU surface
+    (upstream only did that for compositor-initiated resizes, so the window
+    stayed at its startup size),
+  * fixed-size undecorated windows don't show resize cursors at the edges.
+* **Transparency / rounded corners:** on Wayland the area outside the rounded
+  shapes is transparent. On X11 Gio has no ARGB visual, so the window is
+  painted with a solid near-black background (`#0E0E10`) behind the rounded
+  card.
 * **Window decorations on X11:** Gio's X11 backend always requests server-side
   decorations. Navigo removes them itself through `_MOTIF_WM_HINTS`. KWin,
   Mutter, Openbox, xfwm4 and most other window managers honor this. Window

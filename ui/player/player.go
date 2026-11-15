@@ -237,7 +237,6 @@ func (v *View) LayoutNormal(gtx layout.Context, s core.Snapshot) {
 	sz := gtx.Constraints.Max
 	full := image.Rectangle{Max: sz}
 	rad := gtx.Dp(theme.NormalRadius)
-	theme.FillRect(gtx.Ops, full, theme.WindowBG)
 	v.updateArt(gtx, s)
 	v.drawArt(gtx, full, rad, s)
 
@@ -382,7 +381,6 @@ func (v *View) LayoutCompact(gtx layout.Context, s core.Snapshot) {
 	w := gtx.Constraints.Max.X
 	h := gtx.Dp(theme.CompactHeight)
 	full := image.Rect(0, 0, w, h)
-	theme.FillRect(gtx.Ops, image.Rectangle{Max: gtx.Constraints.Max}, theme.WindowBG)
 	theme.FillRRect(gtx.Ops, full, gtx.Dp(theme.CompactRadius), theme.CompactOuter)
 	v.Drag.Layout(gtx, image.Rectangle{Max: gtx.Constraints.Max})
 
