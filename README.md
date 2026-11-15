@@ -187,11 +187,34 @@ would clip. Untagged tracks play unchanged.
 | Cover art | `$XDG_CACHE_HOME/navigo/covers/` |
 | Queue / position | `$XDG_STATE_HOME/navigo/` (default `~/.local/state/navigo/`) |
 
-Tracks are downloaded to `.part` files (resumed with HTTP Range requests) and
-renamed when complete. Playback starts as soon as enough of the file has
-arrived to decode (typically 1-2 s of audio). The next 3 tracks are prefetched in the background. The current and
+Tracks are downloaded to `.part` files and renamed only once the size
+matches `Content-Length` (when the server sends one). Interrupted downloads
+are retried up to 5 times with exponential backoff and jitter, resuming with
+HTTP Range requests from the bytes already on disk (if a server ignores Range
+and answers 200, the download restarts from zero). A download that receives
+no bytes for 10 s is treated as stalled and retried. 401/403/404 fail
+immediately. If a cached file turns out to be corrupt, it is deleted and
+fetched again once.
+
+Playback starts once a few seconds of audio are buffered. This threshold grows
+automatically when the measured download speed is lower than the track's
+bitrate. If playback catches up with the download, Navigo fades out, shows
+*Buffering* and resumes once a larger buffer is available. The state shown in
+the UI and over MPRIS is truthful: *Playing* only while audio is actually
+output. While loading or buffering, the play button shows a spinner, the seek
+bar shimmers, and MPRIS reports *Paused*. "Still loading…" appears after 3 s.
+If nothing plays within 20 s, the track is retried once and then skipped with
+an error.
+
+The current track's download always has priority. At most 2 downloads run at
+once (current + 1 prefetch). The next track is prefetched first, then the 2
+after it (only the next one on connections slower than the track bitrate).
+Prefetches are cancelled when the queue changes. The current and
 prefetched tracks are never evicted. You can change the cache size and clear
 the cache in Settings.
+
+Set `NAVIGO_DEBUG=1` to log the track lifecycle, retries and the window
+placement method to stderr.
 
 ---
 
@@ -292,13 +315,26 @@ toolchain and arm64 system libraries, so either:
   Mutter, Openbox, xfwm4 and most other window managers honor this. Window
   dragging on X11 is done by Navigo (`XMoveWindow`), because Gio ignores the
   move action there. On Wayland, the compositor's interactive move is used.
-* **Panel height changes:** opening a panel changes the window height to 600
-  (and back). If the compositor doesn't apply the change within ~500 ms, Navigo
-  switches automatically to opening panels (and the Compact-mode menu) in a
-  separate undecorated 370×600 window. You can also force that behavior with
-  *Settings → Open panels in separate window*. On X11 the separate window is
-  placed exactly over the main window. On Wayland the compositor chooses its
-  position.
+* **Panel height changes / screen edges:** opening a panel changes the window
+  height to 600 (and the Compact-mode menu grows the 64 px bar). The window
+  grows in whichever direction has room: upward when it sits near the bottom
+  of the screen, clamped to the work area of the monitor containing its
+  center (panels excluded). It returns to its exact original rect when the
+  panel closes, or follows the window if you dragged it meanwhile. Gio can't
+  position windows (and Wayland forbids it), so Navigo picks a backend at
+  runtime, shown in *Settings → Window placement*:
+  * **KWin** (KDE Plasma, Wayland or X11): a short KWin script is loaded
+    over D-Bus (`org.kde.KWin /Scripting`), reads and sets the window's
+    `frameGeometry` and reports back to `org.navigo.Helper`. It is unloaded
+    afterwards.
+  * **X11**: pure-Go X11 (`_NET_WORKAREA`, RandR monitors,
+    `_NET_MOVERESIZE_WINDOW` or `ConfigureWindow`).
+  * **unavailable** (e.g. Wayland outside KDE): panels and the Compact-mode
+    menu open in a separate undecorated window that the compositor places, so
+    nothing is clipped.
+  If the compositor doesn't apply a size change within ~500 ms, Navigo also
+  switches to separate windows. You can force that behavior with
+  *Settings → Open panels in separate window*.
 * **Window position:** saved and restored on X11. Wayland does not let
   clients read or set their position, so the compositor decides (KWin can pin
   it with a Window Rule).

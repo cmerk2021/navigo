@@ -6,7 +6,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"math"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,21 +26,33 @@ const chunkFrames = 1024
 // ringChunks bounds decoded audio buffered ahead of the output (~140 ms).
 const ringChunks = 6
 
-// State is the playback state.
+// State is the playback state. It reflects what is audible: Playing is only
+// entered once samples of the current track reach the output.
 type State int32
 
 // Playback states.
 const (
 	Stopped State = iota
+	// Loading: a track was selected and is being opened/pre-buffered.
 	Loading
+	// Playing: audio of the current track is being output.
 	Playing
+	// Paused by the user.
 	Paused
+	// Buffering: playback ran out of data mid-track (or the gapless
+	// successor isn't ready) and resumes automatically.
 	Buffering
+	// Error: the current track failed to load.
+	Error
 )
 
 func (s State) String() string {
-	return [...]string{"Stopped", "Loading", "Playing", "Paused", "Buffering"}[s]
+	return [...]string{"Stopped", "Loading", "Playing", "Paused", "Buffering", "Error"}[s]
 }
+
+// Waiting reports whether the state means "play requested, waiting for
+// audio" (the UI shows a spinner).
+func (s State) Waiting() bool { return s == Loading || s == Buffering }
 
 // EventKind identifies an engine event.
 type EventKind int
@@ -57,7 +72,10 @@ const (
 	EvDeviceError
 )
 
-// Event is published to the UI/controller.
+// Event is published to the UI/controller. Every event is tagged with the
+// track it belongs to (ID is the Media ID, Seq the engine's sequence number
+// of that track instance) so that listeners can drop events of tracks that
+// are no longer current.
 type Event struct {
 	Kind  EventKind
 	State State
@@ -80,6 +98,12 @@ type Media struct {
 	// Open returns a decoder positioned at the start. It may block until data
 	// is available and must honour ctx cancellation.
 	Open func(ctx context.Context) (Decoder, error)
+	// Duration is the expected length (0 if unknown). Decode errors within
+	// the last moments of a track are treated as its end.
+	Duration time.Duration
+	// Urgent, if set, is called when playback is waiting for this (prepared
+	// next) track, so its download can be prioritised.
+	Urgent func()
 }
 
 type chunk struct {
@@ -94,13 +118,37 @@ type chunk struct {
 }
 
 type track struct {
-	media *Media
-	dec   Decoder
-	rs    *resampler // nil if no resampling needed
-	seq   int64
-	pos   int64 // frames produced (output rate)
-	auto  bool
-	rg    ReplayGain // server values merged with file tags
+	media   *Media
+	dec     Decoder
+	rs      *resampler // nil if no resampling needed
+	seq     int64
+	pos     int64 // frames produced (output rate)
+	auto    bool
+	rg      ReplayGain // server values merged with file tags
+	started bool       // produced samples since opening
+}
+
+// nearEnd reports whether the track is at (or within a moment of) its end,
+// in which case a decode error is treated as the normal end of the track:
+// trailing tags/garbage or a truncated last frame shouldn't be reported as
+// a playback error (or surface at the start of the next track).
+func (t *track) nearEnd() bool {
+	if l := t.dec.Length(); l > 0 {
+		out := l
+		if r := t.dec.SampleRate(); r > 0 && r != SampleRate {
+			out = l * SampleRate / int64(r)
+		}
+		if t.pos >= out-SampleRate/2 {
+			return true
+		}
+	}
+	if d := t.media.Duration; d > 0 && t.pos >= durToFrames(d-1500*time.Millisecond) {
+		return true
+	}
+	if ae, ok := t.dec.(interface{ atEnd() bool }); ok && ae.atEnd() {
+		return true
+	}
+	return false
 }
 
 func (t *track) read(dst []float32) (int, error) {
@@ -153,11 +201,19 @@ type Engine struct {
 	// position of the audio currently heard
 	posFrames atomic.Int64
 	posSeq    atomic.Int64
+	// startedSeq is the seq of the last track whose samples were output.
+	startedSeq atomic.Int64
+	// curSeq is the seq of the worker's current track.
+	curSeq atomic.Int64
+	// waiting is set while the current track's source has no data (or the
+	// gapless successor is not ready yet).
+	waiting atomic.Bool
+	// active is set while a track is playing or about to continue, i.e.
+	// an empty ring means an underrun rather than the end.
+	active atomic.Bool
 
 	mu         sync.Mutex
 	interrupts []func() // aborts blocking work in the worker
-	waiting    bool
-	bufTimer   *time.Timer
 
 	// output stage (only touched by the output goroutine)
 	out outStage
@@ -172,10 +228,20 @@ type outStage struct {
 	off       int
 	lastSeq   int64
 	gain      float32 // pause fade gain
-	fadeIn    int     // frames of seek fade-in remaining
+	fadeIn    int     // frames of seek/resume fade-in remaining
+	fadeLen   int     // length of the current fade-in
+	fadeOut   bool    // fade the current chunk out (the source is starving)
 	silentFor int     // frames of silence output while paused
 	buf       []float32
 	endSent   bool
+	// underrun counts frames output without data while playing.
+	underrun int
+	// starved is set after a starvation fade-out: the next underrun enters
+	// Buffering immediately.
+	starved bool
+	// rebuffer holds output after an underrun until the ring has refilled.
+	rebuffer     bool
+	rebufferWait int
 }
 
 // New creates an engine. Call StartDevice to begin audio output.
@@ -191,6 +257,8 @@ func New() *Engine {
 	e.volume.Store(math.Float64bits(1))
 	e.out.lastSeq = -1
 	e.posSeq.Store(-1)
+	e.startedSeq.Store(-1)
+	e.curSeq.Store(-1)
 	go e.worker()
 	return e
 }
@@ -212,9 +280,22 @@ func (e *Engine) emit(ev Event) {
 func (e *Engine) State() State { return State(e.state.Load()) }
 
 func (e *Engine) setState(s State) {
-	if State(e.state.Swap(int32(s))) != s {
-		e.emit(Event{Kind: EvState, State: s})
+	if old := State(e.state.Swap(int32(s))); old != s {
+		slog.Debug("audio: state", "from", old, "to", s, "seq", e.posSeq.Load())
+		e.emit(Event{Kind: EvState, State: s, Seq: e.posSeq.Load()})
 	}
+}
+
+// casState changes the state from one of the given states only.
+func (e *Engine) casState(to State, from ...State) bool {
+	for _, f := range from {
+		if e.state.CompareAndSwap(int32(f), int32(to)) {
+			slog.Debug("audio: state", "from", f, "to", to, "seq", e.posSeq.Load())
+			e.emit(Event{Kind: EvState, State: to, Seq: e.posSeq.Load()})
+			return true
+		}
+	}
+	return false
 }
 
 // Position returns the playback position of the current track.
@@ -275,6 +356,9 @@ func (e *Engine) Load(m *Media, pos time.Duration, paused bool) int64 {
 	e.paused.Store(paused)
 	e.posFrames.Store(durToFrames(pos))
 	e.posSeq.Store(seq)
+	e.active.Store(false)
+	e.waiting.Store(false)
+	slog.Debug("audio: track requested", "id", m.ID, "seq", seq, "pos", pos, "paused", paused)
 	e.setState(Loading)
 	e.interruptWorker()
 	e.send(command{kind: cmdLoad, media: m, pos: durToFrames(pos), gen: gen, seq: seq})
@@ -303,6 +387,8 @@ func (e *Engine) Stop() {
 	e.interruptWorker()
 	e.send(command{kind: cmdStop, gen: gen})
 	e.posFrames.Store(0)
+	e.active.Store(false)
+	e.waiting.Store(false)
 	e.setState(Stopped)
 }
 
@@ -321,15 +407,13 @@ func (e *Engine) Resume() {
 	if d := e.device.Load(); d != nil {
 		d.wake()
 	}
-	if e.State() == Paused {
-		e.mu.Lock()
-		w := e.waiting
-		e.mu.Unlock()
-		if w {
-			e.setState(Buffering)
-		} else {
-			e.setState(Playing)
-		}
+	// Playing is entered by the output once audio is actually delivered.
+	switch {
+	case e.State() != Paused:
+	case e.waiting.Load():
+		e.casState(Buffering, Paused)
+	case e.startedSeq.Load() != e.posSeq.Load():
+		e.casState(Loading, Paused)
 	}
 }
 
@@ -348,33 +432,38 @@ func (e *Engine) Close() {
 }
 
 // SetBuffering reports that the current track's data source is stalled
-// (true) or flowing again (false).
+// (true) or flowing again (false). Sources that implement SetWaitHook are
+// watched automatically.
 func (e *Engine) SetBuffering(w bool) { e.setWaiting(w) }
 
-// setWaiting is called when the worker blocks on (or resumes from) data.
-// Buffering is only reported if the wait lasts a little while.
+// setWaiting records whether the current track is starved of data. The
+// output stage turns a resulting underrun into the Buffering state.
 func (e *Engine) setWaiting(w bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.waiting = w
-	if e.bufTimer != nil {
-		e.bufTimer.Stop()
-		e.bufTimer = nil
-	}
-	if w {
-		e.bufTimer = time.AfterFunc(200*time.Millisecond, func() {
-			e.mu.Lock()
-			still := e.waiting
-			e.mu.Unlock()
-			if still && !e.paused.Load() && e.State() == Playing {
-				e.setState(Buffering)
+	if e.waiting.Swap(w) != w {
+		slog.Debug("audio: source waiting", "waiting", w, "seq", e.curSeq.Load())
+		if !w {
+			if d := e.device.Load(); d != nil {
+				d.wake()
 			}
-		})
-	} else if e.State() == Buffering && !e.paused.Load() {
-		e.state.Store(int32(Playing))
-		e.emit(Event{Kind: EvState, State: Playing})
+		}
 	}
 }
+
+// watch installs a wait hook on t's source that reports stalls while t is
+// the current track (stale tracks can't affect the state).
+func (e *Engine) watch(t *track) {
+	e.curSeq.Store(t.seq)
+	if h, ok := t.dec.(waitHooker); ok {
+		seq := t.seq
+		h.SetWaitHook(func(w bool) {
+			if e.curSeq.Load() == seq {
+				e.setWaiting(w)
+			}
+		})
+	}
+}
+
+type waitHooker interface{ SetWaitHook(func(bool)) }
 
 // ---------------- worker ----------------
 
@@ -462,13 +551,16 @@ func (w *workerState) onPrepared(p prepared) {
 	}
 	w.prepCancel = nil
 	if p.err != nil {
-		if !isInterrupt(p.err) {
-			w.e.emit(Event{Kind: EvError, ID: p.media.ID, Err: p.err, Open: true})
+		if !isTeardown(p.err) {
+			w.e.emit(Event{Kind: EvError, ID: p.media.ID, Seq: -1, Err: p.err, Open: true})
+		} else {
+			slog.Debug("audio: prepare cancelled", "id", p.media.ID, "err", p.err)
 		}
 		w.nextMedia = nil
 		return
 	}
 	w.next = p.t
+	slog.Debug("audio: next track ready", "id", p.media.ID)
 }
 
 func (w *workerState) handle(c command) {
@@ -481,6 +573,7 @@ func (w *workerState) handle(c command) {
 	case cmdStop:
 		w.cur.close()
 		w.cur, w.pending, w.awaiting = nil, nil, false
+		e.curSeq.Store(-1)
 		w.setInterrupt(nil, nil)
 		w.startPrepare(nil)
 	case cmdSetNext:
@@ -491,18 +584,20 @@ func (w *workerState) handle(c command) {
 	case cmdLoad:
 		w.cur.close()
 		w.cur, w.pending, w.awaiting = nil, nil, false
-		e.setWaiting(false)
+		e.curSeq.Store(c.seq)
 		ctx, cancel := context.WithCancel(context.Background())
 		w.setInterrupt(nil, cancel)
 		t, err := e.openTrack(ctx, c.media, c.pos)
 		superseded := ctx.Err() != nil || e.gen.Load() != c.gen
 		cancel()
 		if err != nil {
-			if superseded {
-				return // superseded
+			if superseded || isTeardown(err) {
+				slog.Debug("audio: load superseded", "id", c.media.ID, "seq", c.seq, "err", err)
+				return
 			}
-			e.setState(Stopped)
-			e.emit(Event{Kind: EvError, ID: c.media.ID, Err: err, Open: true})
+			slog.Debug("audio: open failed", "id", c.media.ID, "seq", c.seq, "err", err)
+			e.setState(Error)
+			e.emit(Event{Kind: EvError, ID: c.media.ID, Seq: c.seq, Err: err, Open: true})
 			return
 		}
 		if e.gen.Load() != c.gen {
@@ -512,10 +607,11 @@ func (w *workerState) handle(c command) {
 		t.seq, t.pos = c.seq, c.pos
 		w.cur = t
 		w.setInterrupt(w.cur, nil)
+		e.watch(t)
+		e.active.Store(true)
+		slog.Debug("audio: decoder opened", "id", c.media.ID, "seq", c.seq, "rate", t.dec.SampleRate())
 		if e.paused.Load() {
-			e.setState(Paused)
-		} else {
-			e.setState(Playing)
+			e.casState(Paused, Loading)
 		}
 	case cmdSeek:
 		if w.cur == nil {
@@ -538,6 +634,7 @@ func (w *workerState) handle(c command) {
 			if err == nil {
 				t.seq, t.auto = cur.seq, cur.auto
 				w.cur = t
+				e.watch(t)
 			}
 		}
 		if err != nil {
@@ -549,7 +646,7 @@ func (w *workerState) handle(c command) {
 				}
 				return
 			}
-			e.emit(Event{Kind: EvError, ID: cur.media.ID, Err: err})
+			e.emit(Event{Kind: EvError, ID: cur.media.ID, Seq: cur.seq, Err: err})
 			w.cur.close()
 			w.cur = nil
 			w.awaiting = true
@@ -605,13 +702,24 @@ func (e *Engine) worker() {
 				nt.auto = true
 				w.cur = nt
 				w.setInterrupt(nt, nil)
+				e.watch(nt)
 				e.setWaiting(false)
+				slog.Debug("audio: gapless transition", "id", nt.media.ID, "seq", nt.seq)
 			case w.nextMedia == nil:
 				w.awaiting = false
 				e.setWaiting(false)
+				e.active.Store(false)
 				w.pending = &chunk{gen: w.endGen, seq: w.endSeq, id: w.endID, end: true}
 			default:
-				e.setWaiting(true) // next track still loading
+				// The successor isn't ready: the output underruns into
+				// Buffering instead of pretending to play.
+				if !e.waiting.Load() {
+					slog.Debug("audio: waiting for the next track", "id", w.nextMedia.ID)
+					if w.nextMedia.Urgent != nil {
+						go w.nextMedia.Urgent()
+					}
+				}
+				e.setWaiting(true)
 			}
 		}
 
@@ -660,6 +768,24 @@ func isInterrupt(err error) bool {
 	return err != nil && (errors.Is(err, errInterrupted) || err.Error() == "read interrupted" || errors.Is(err, context.Canceled))
 }
 
+// IsTeardown reports whether err comes from intentionally stopping a track
+// (see isTeardown).
+func IsTeardown(err error) bool { return isTeardown(err) }
+
+// isTeardown reports errors caused by intentionally stopping/closing a
+// track (cancelled contexts, interrupted or closed sources). They are part
+// of the normal track lifecycle, never playback errors.
+func isTeardown(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isInterrupt(err) || errors.Is(err, os.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "file already closed") || strings.Contains(msg, "use of closed")
+}
+
 // produce decodes the next chunk from the current track. At EOF it marks the
 // track finished so the loop can continue gaplessly with the next one.
 func (w *workerState) produce() *chunk {
@@ -671,22 +797,37 @@ func (w *workerState) produce() *chunk {
 	if n > 0 {
 		c := &chunk{gen: gen, seq: cur.seq, id: cur.media.ID, auto: cur.auto, start: cur.pos, gain: cur.rg.Factor(e.ReplayGainMode()), samples: buf[:n*2]}
 		cur.pos += int64(n)
+		cur.started = true
 		return c
 	}
 	if err == nil {
 		return nil
 	}
-	if isInterrupt(err) {
+	if isTeardown(err) {
 		// A command is pending. Wait for it rather than spinning.
-		select {
-		case c := <-e.cmds:
-			w.handle(c)
-		case <-e.closed:
+		for {
+			select {
+			case c := <-e.cmds:
+				w.handle(c)
+			case p := <-w.prepCh:
+				w.onPrepared(p)
+				continue
+			case <-e.closed:
+			}
+			return nil
 		}
-		return nil
 	}
-	if err != io.EOF {
-		e.emit(Event{Kind: EvError, ID: cur.media.ID, Err: err})
+	switch {
+	case err == io.EOF:
+		slog.Debug("audio: track finished", "id", cur.media.ID, "seq", cur.seq)
+	case cur.nearEnd():
+		// Trailing junk/tags or a truncated last frame: a normal end.
+		slog.Debug("audio: decode error at end of track treated as EOF", "id", cur.media.ID, "seq", cur.seq, "err", err)
+	default:
+		slog.Debug("audio: decode error", "id", cur.media.ID, "seq", cur.seq, "err", err)
+		// Failing before producing any audio is an open failure (the
+		// controller may re-fetch or transcode).
+		e.emit(Event{Kind: EvError, ID: cur.media.ID, Seq: cur.seq, Err: err, Open: !cur.started && !cur.auto})
 	}
 	cur.close()
 	w.cur = nil
@@ -786,12 +927,27 @@ func (e *Engine) Render(dst []float32) {
 				dst[2*i+1] = o.cur.samples[o.off+2*i+1] * g
 			}
 		}
-		o.cur = nil
-		o.fadeIn = seekFadeFrames
+		o.cur, o.fadeOut = nil, false
+		o.fadeIn, o.fadeLen = seekFadeFrames, seekFadeFrames
 		e.post(dst[:n*2], 1)
 		clear(dst[n*2:])
 		e.post(dst[n*2:], 1)
 		return
+	}
+
+	if o.rebuffer {
+		o.rebufferWait += frames
+		if paused || !e.readyToResume(o.rebufferWait) {
+			clear(dst)
+			e.post(dst, 1)
+			if paused && o.gain > 0 {
+				o.gain = 0 // nothing was audible; resume with a fade-in
+			}
+			return
+		}
+		slog.Debug("audio: buffer refilled, resuming output", "seq", e.posSeq.Load())
+		o.rebuffer, o.rebufferWait = false, 0
+		o.fadeIn, o.fadeLen = pauseFadeFrames, pauseFadeFrames
 	}
 
 	i := 0
@@ -800,7 +956,7 @@ func (e *Engine) Render(dst []float32) {
 			break
 		}
 		if o.cur == nil || o.off >= len(o.cur.samples) {
-			o.cur, o.off = nil, 0
+			o.cur, o.off, o.fadeOut = nil, 0, false
 			var c *chunk
 		next:
 			for {
@@ -823,12 +979,17 @@ func (e *Engine) Render(dst []float32) {
 					o.endSent = true
 					e.posFrames.Store(0)
 					e.setState(Stopped)
-					e.emit(Event{Kind: EvEnded, ID: c.id})
+					e.emit(Event{Kind: EvEnded, ID: c.id, Seq: c.seq})
 				}
 				continue
 			}
 			o.endSent = false
 			o.cur = c
+			if len(e.ring) == 0 && e.waiting.Load() && !paused {
+				// The source is starving: fade this chunk out instead of
+				// cutting off abruptly at the underrun.
+				o.fadeOut, o.starved = true, true
+			}
 			if c.seq != o.lastSeq {
 				o.lastSeq = c.seq
 				e.posSeq.Store(c.seq)
@@ -837,6 +998,7 @@ func (e *Engine) Render(dst []float32) {
 		}
 		c := o.cur
 		n := min((len(c.samples)-o.off)/2, frames-i)
+		total := len(c.samples) / 2
 		for k := 0; k < n; k++ {
 			// pause/resume fade
 			target := float32(1)
@@ -850,8 +1012,11 @@ func (e *Engine) Render(dst []float32) {
 			}
 			g := c.gain * o.gain
 			if o.fadeIn > 0 {
-				g *= 1 - float32(o.fadeIn)/float32(seekFadeFrames)
+				g *= 1 - float32(o.fadeIn)/float32(max(o.fadeLen, 1))
 				o.fadeIn--
+			}
+			if o.fadeOut {
+				g *= float32(total-(o.off/2+k)-1) / float32(total)
 			}
 			dst[2*(i+k)] = c.samples[o.off+2*k] * g
 			dst[2*(i+k)+1] = c.samples[o.off+2*k+1] * g
@@ -859,6 +1024,9 @@ func (e *Engine) Render(dst []float32) {
 		o.off += n * 2
 		i += n
 		e.posFrames.Store(c.start + int64(o.off/2))
+		if n > 0 && !paused && c.seq == e.posSeq.Load() {
+			e.markPlaying(c)
+		}
 		if paused && o.gain <= 0 {
 			break
 		}
@@ -869,7 +1037,53 @@ func (e *Engine) Render(dst []float32) {
 	} else {
 		o.silentFor = 0
 	}
+	if i < frames && !paused && e.active.Load() {
+		// Out of data mid-track. Short hiccups are tolerated; a real
+		// underrun (or one announced by a starvation fade) holds the
+		// output until the buffer has refilled.
+		o.underrun += frames - i
+		if o.starved || o.underrun >= underrunGrace {
+			o.starved, o.underrun = false, 0
+			o.rebuffer, o.rebufferWait = true, 0
+			slog.Debug("audio: underrun", "seq", e.posSeq.Load(), "waiting", e.waiting.Load())
+			e.casState(Buffering, Playing)
+		}
+	} else if i == frames {
+		o.underrun = 0
+	}
 	e.post(dst, 1)
+}
+
+// underrunGrace is how long the output may run dry before Buffering.
+const underrunGrace = SampleRate / 10
+
+// readyToResume reports whether output can continue after an underrun: the
+// ring is (nearly) full, or the source isn't waiting and some data has been
+// queued for a moment (e.g. the short tail of a track).
+func (e *Engine) readyToResume(waited int) bool {
+	n := len(e.ring)
+	if n >= ringChunks-1 {
+		return true
+	}
+	if !e.active.Load() {
+		return true // ended or stopped: let the end marker through
+	}
+	return n > 0 && !e.waiting.Load() && waited >= SampleRate/20
+}
+
+// markPlaying switches to Playing when audio of the current track reaches
+// the output (called from the output stage).
+func (e *Engine) markPlaying(c *chunk) {
+	if e.startedSeq.Swap(c.seq) != c.seq {
+		slog.Debug("audio: first samples output", "id", c.id, "seq", c.seq)
+	}
+	if e.State() == Playing {
+		return
+	}
+	if e.casState(Playing, Loading, Buffering, Paused) && e.paused.Load() {
+		// Raced with Pause.
+		e.casState(Paused, Playing)
+	}
 }
 
 // post applies EQ, limiter and volume.

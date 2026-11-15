@@ -40,7 +40,7 @@ func makeWAV(rate, frames int, f func(i int) float64) []byte {
 func wavMedia(id string, data []byte) *Media {
 	return FromSource(id, "wav", ReplayGain{}, func(context.Context) (Source, error) {
 		return NewMemSource(data), nil
-	}, nil)
+	})
 }
 
 // renderAll drives the output stage until playback ends, waiting for the

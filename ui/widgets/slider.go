@@ -20,6 +20,9 @@ import (
 type Seekbar struct {
 	dragging bool
 	frac     float32
+	// Loading animates the not-yet-downloaded part of the track while
+	// playback waits for data.
+	Loading bool
 }
 
 // Dragging reports whether the user is dragging the knob.
@@ -87,6 +90,15 @@ func (s *Seekbar) Layout(gtx layout.Context, th *theme.Theme, pos, dur time.Dura
 		br := tr
 		br.Max.X = pad + int(float64(tw)*buffered)
 		theme.FillPill(gtx.Ops, br, theme.SeekBuffered)
+	}
+	if s.Loading {
+		// Shimmer over the unbuffered area (or the whole track when it is
+		// fully downloaded but the decoder is still starting).
+		ur := tr
+		if buffered > 0 && buffered < 1 {
+			ur.Min.X = pad + int(float64(tw)*buffered)
+		}
+		theme.Shimmer(gtx, ur, theme.SeekShimmer)
 	}
 	fx := pad + int(float32(tw)*frac)
 	fr := tr

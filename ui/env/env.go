@@ -60,4 +60,7 @@ type Env struct {
 	Close func()
 	// Toast shows a transient message (safe from any goroutine).
 	Toast func(text string, isErr bool)
+	// Placement names the active window placement method ("KWin", "X11",
+	// "unavailable").
+	Placement func() string
 }

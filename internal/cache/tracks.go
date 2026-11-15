@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -54,8 +55,8 @@ func sanitize(s string) string {
 type Priority int
 
 const (
-	// Low priority downloads (prefetch) run one at a time and only when no
-	// high priority download is active.
+	// Low priority downloads (prefetch) run one at a time and only while the
+	// current track's download is healthy (or finished).
 	Low Priority = iota
 	// High priority downloads (the current track) start immediately.
 	High
@@ -64,9 +65,43 @@ const (
 // ErrInterrupted is returned by Reader.Read after Interrupt.
 var ErrInterrupted = errors.New("read interrupted")
 
+// Buffering policy defaults.
+const (
+	// StartSeconds of audio must be downloaded before a track starts.
+	StartSeconds = 3.0
+	// ResumeSeconds of audio must be available again after an underrun
+	// before reads continue (avoids rapid stutter on slow links).
+	ResumeSeconds = 6.0
+	// MinStartBytes is the minimum start/resume buffer.
+	MinStartBytes = 256 << 10
+	// maxPrebufferSeconds caps the extra pre-buffer on slow links.
+	maxPrebufferSeconds = 60.0
+	// healthySeconds of audio buffered ahead of the current track's play
+	// position allow a prefetch to run concurrently; below
+	// unhealthySeconds a running prefetch yields.
+	healthySeconds   = 30.0
+	unhealthySeconds = 15.0
+	// maxDownloads is the number of concurrent downloads (current + one
+	// prefetch).
+	maxDownloads = 2
+	// defaultBytesPerSec is assumed when a track's bitrate is unknown.
+	defaultBytesPerSec = 100_000
+)
+
 // Manager owns the cache directory.
 type Manager struct {
 	dir string
+
+	// StallTimeout aborts (and retries) a download when no bytes arrive for
+	// this long. MaxAttempts bounds consecutive failed attempts; BackoffBase
+	// and BackoffMax shape the exponential backoff between them. Set them
+	// before the first Get.
+	StallTimeout time.Duration
+	MaxAttempts  int
+	BackoffBase  time.Duration
+	BackoffMax   time.Duration
+
+	meter meter
 
 	mu       sync.Mutex
 	cond     *sync.Cond
@@ -74,10 +109,12 @@ type Manager struct {
 	maxBytes int64
 	entries  map[string]*Entry
 	pinned   map[string]bool
-	highBusy int
+	current  string                   // key of the current track
+	writers  map[string]chan struct{} // exit channel of the goroutine writing each key
+	active   int                      // running fetches
+	lowRun   int                      // running low-priority fetches
 	prefetch []Request
 	pfCancel context.CancelFunc
-	pfGen    int
 	closed   bool
 }
 
@@ -85,10 +122,15 @@ type Manager struct {
 func New(dir string, maxBytes int64) *Manager {
 	os.MkdirAll(dir, 0o700)
 	m := &Manager{
-		dir:      dir,
-		maxBytes: maxBytes,
-		entries:  map[string]*Entry{},
-		pinned:   map[string]bool{},
+		dir:          dir,
+		maxBytes:     maxBytes,
+		entries:      map[string]*Entry{},
+		pinned:       map[string]bool{},
+		writers:      map[string]chan struct{}{},
+		StallTimeout: 10 * time.Second,
+		MaxAttempts:  5,
+		BackoffBase:  500 * time.Millisecond,
+		BackoffMax:   8 * time.Second,
 	}
 	m.cond = sync.NewCond(&m.mu)
 	return m
@@ -123,6 +165,28 @@ func (m *Manager) Pin(reqs ...Request) {
 	m.mu.Unlock()
 }
 
+// Throughput returns the moving-average download rate in bytes/s (0 when
+// unknown).
+func (m *Manager) Throughput() float64 { return m.meter.rate() }
+
+// SetCurrent marks r as the track being played. Its download always has
+// priority: other high-priority downloads are demoted to prefetch priority
+// (and yield while the current download is unhealthy).
+func (m *Manager) SetCurrent(r Request) {
+	key := r.Key()
+	m.mu.Lock()
+	m.current = key
+	for k, e := range m.entries {
+		if k == key {
+			e.prio = High
+		} else if e.prio == High {
+			e.prio = Low
+		}
+	}
+	m.cond.Broadcast()
+	m.mu.Unlock()
+}
+
 func (m *Manager) finalPath(key string) string { return filepath.Join(m.dir, key) }
 func (m *Manager) partPath(key string) string  { return filepath.Join(m.dir, key+".part") }
 
@@ -132,7 +196,8 @@ func (m *Manager) Cached(r Request) bool {
 	return err == nil
 }
 
-// Get returns the entry for r, starting a download if necessary.
+// Get returns the entry for r, starting a download if necessary. A Low
+// request never downgrades an existing entry; a High request upgrades it.
 func (m *Manager) Get(r Request, prio Priority) *Entry {
 	key := r.Key()
 	m.mu.Lock()
@@ -148,35 +213,43 @@ func (m *Manager) Get(r Request, prio Priority) *Entry {
 			return e
 		}
 	}
-	e := &Entry{m: m, req: r, key: key, total: -1, prio: prio, doneCh: make(chan struct{})}
+	e := &Entry{m: m, req: r, key: key, total: -1, prio: prio, cancel: func() {}, doneCh: make(chan struct{}), exited: make(chan struct{})}
 	e.cond = sync.NewCond(&e.mu)
 	if fi, err := os.Stat(m.finalPath(key)); err == nil {
 		e.path = m.finalPath(key)
 		e.written = fi.Size()
 		e.total = fi.Size()
 		e.done = true
+		e.fromDisk = true
 		close(e.doneCh)
+		close(e.exited)
 		now := time.Now()
 		os.Chtimes(e.path, now, now)
 		m.entries[key] = e
 		return e
 	}
 	e.path = m.partPath(key)
-	if f, err := os.OpenFile(e.path, os.O_WRONLY|os.O_CREATE, 0o600); err == nil {
-		if fi, err := f.Stat(); err == nil {
+	prev := m.writers[key]
+	m.writers[key] = e.exited
+	if prev == nil {
+		// Nobody is writing the .part file: what's on disk can be read
+		// right away (and is resumed by the download).
+		if fi, err := os.Stat(e.path); err == nil {
 			e.written = fi.Size()
 		}
-		f.Close()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	e.cancel = cancel
 	m.entries[key] = e
-	go e.download(ctx)
+	slog.Debug("cache: download requested", "key", key, "prio", prio)
+	go e.download(ctx, prev)
 	return e
 }
 
 // Prefetch replaces the prefetch list. Downloads run sequentially at low
-// priority; in-flight prefetches that are no longer wanted are cancelled.
+// priority, the next track first; in-flight prefetches that are no longer
+// wanted (and not being read) are cancelled. On a link slower than the
+// current track's bitrate only the first request is prefetched.
 func (m *Manager) Prefetch(reqs []Request) {
 	m.mu.Lock()
 	want := map[string]bool{}
@@ -184,7 +257,8 @@ func (m *Manager) Prefetch(reqs []Request) {
 		want[r.Key()] = true
 	}
 	for k, e := range m.entries {
-		if !e.isDone() && e.prio == Low && !want[k] {
+		if k != m.current && e.prio == Low && !want[k] && !e.isDone() && !e.hasReaders() {
+			slog.Debug("cache: prefetch cancelled", "key", k)
 			e.cancel()
 			delete(m.entries, k)
 		}
@@ -200,8 +274,12 @@ func (m *Manager) Prefetch(reqs []Request) {
 }
 
 func (m *Manager) runPrefetch(ctx context.Context, reqs []Request) {
-	for _, r := range reqs {
+	for i, r := range reqs {
 		if ctx.Err() != nil {
+			return
+		}
+		if i > 0 && m.slowLink() {
+			slog.Debug("cache: slow link, only prefetching the next track", "rate", m.Throughput())
 			return
 		}
 		if m.Cached(r) {
@@ -216,6 +294,25 @@ func (m *Manager) runPrefetch(ctx context.Context, reqs []Request) {
 	}
 }
 
+// slowLink reports whether the measured throughput is below the current
+// track's bitrate.
+func (m *Manager) slowLink() bool {
+	rate := m.Throughput()
+	if rate <= 0 {
+		return false
+	}
+	m.mu.Lock()
+	cur := m.entries[m.current]
+	m.mu.Unlock()
+	bps := float64(defaultBytesPerSec)
+	if cur != nil {
+		cur.mu.Lock()
+		bps = cur.bpsLocked()
+		cur.mu.Unlock()
+	}
+	return rate < bps
+}
+
 // Forget drops a finished or failed entry from the in-memory table so that
 // a later Get retries (used after errors).
 func (m *Manager) Forget(r Request) {
@@ -226,14 +323,29 @@ func (m *Manager) Forget(r Request) {
 	m.mu.Unlock()
 }
 
+// Invalidate cancels and deletes a cached track (e.g. after the decoder
+// found it corrupt) so that the next Get downloads it from scratch.
+func (m *Manager) Invalidate(r Request) {
+	key := r.Key()
+	m.mu.Lock()
+	e := m.entries[key]
+	delete(m.entries, key)
+	m.mu.Unlock()
+	if e != nil {
+		e.cancel()
+		<-e.exited
+	}
+	os.Remove(m.finalPath(key))
+	os.Remove(m.partPath(key))
+	slog.Debug("cache: invalidated", "key", key)
+}
+
 // Close cancels all downloads.
 func (m *Manager) Close() {
 	m.mu.Lock()
 	m.closed = true
 	for _, e := range m.entries {
-		if e.cancel != nil {
-			e.cancel()
-		}
+		e.cancel()
 	}
 	if m.pfCancel != nil {
 		m.pfCancel()
@@ -285,7 +397,7 @@ func (m *Manager) Clear() error {
 		keep[k] = true
 	}
 	for k, e := range m.entries {
-		if !e.isDone() || m.pinned[k] {
+		if e.inUse() || m.pinned[k] {
 			keep[k] = true
 		} else {
 			delete(m.entries, k)
@@ -312,6 +424,9 @@ func (m *Manager) evict() {
 	protected := map[string]bool{}
 	for k := range m.pinned {
 		protected[k] = true
+	}
+	if m.current != "" {
+		protected[m.current] = true
 	}
 	for k, e := range m.entries {
 		if e.inUse() {
@@ -364,21 +479,26 @@ func (m *Manager) evict() {
 
 // Entry is a (possibly in-progress) cached track.
 type Entry struct {
-	m      *Manager
-	req    Request
-	key    string
-	cancel context.CancelFunc
-	doneCh chan struct{}
+	m       *Manager
+	req     Request
+	key     string
+	cancel  context.CancelFunc
+	doneCh  chan struct{}
+	exited  chan struct{} // closed when the download goroutine returns
+	prio    Priority      // guarded by m.mu
+	lowSlot bool          // holds a low-priority download slot; guarded by m.mu
 
-	mu      sync.Mutex
-	cond    *sync.Cond
-	path    string
-	written int64
-	total   int64
-	done    bool
-	err     error
-	prio    Priority
-	readers int
+	mu       sync.Mutex
+	cond     *sync.Cond
+	path     string
+	written  int64
+	total    int64
+	done     bool
+	err      error
+	readers  int
+	readPos  int64         // furthest position read by any reader
+	dur      time.Duration // track duration hint (for bitrate estimates)
+	fromDisk bool          // complete file found in the cache at Get
 }
 
 // Request returns the request for this entry.
@@ -387,10 +507,32 @@ func (e *Entry) Request() Request { return e.req }
 // Done is closed when the download finished (successfully or not).
 func (e *Entry) Done() <-chan struct{} { return e.doneCh }
 
+// FromDisk reports whether the entry was already completely cached when it
+// was created (as opposed to downloaded in this session).
+func (e *Entry) FromDisk() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.fromDisk
+}
+
+// SetDuration sets the track duration, used to estimate its bitrate for
+// the buffering thresholds.
+func (e *Entry) SetDuration(d time.Duration) {
+	e.mu.Lock()
+	e.dur = d
+	e.mu.Unlock()
+}
+
 func (e *Entry) inUse() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return !e.done || e.readers > 0
+}
+
+func (e *Entry) hasReaders() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.readers > 0
 }
 
 func (e *Entry) isDone() bool {
@@ -413,18 +555,67 @@ func (e *Entry) Err() error {
 	return e.err
 }
 
+// bpsLocked estimates the track's bytes per second of audio.
+func (e *Entry) bpsLocked() float64 {
+	switch {
+	case e.dur > 0 && e.total > 0:
+		return float64(e.total) / e.dur.Seconds()
+	case e.req.BitRate > 0:
+		return float64(e.req.BitRate) * 125
+	}
+	return defaultBytesPerSec
+}
+
+// needLocked returns how many bytes past pos must be available before
+// playback (re)starts: secs of audio (at least MinStartBytes), raised on
+// links slower than the track's bitrate so that the rest of the download
+// finishes before playback catches up.
+func (e *Entry) needLocked(pos int64, secs float64) int64 {
+	bps := e.bpsLocked()
+	need := int64(secs * bps)
+	if need < MinStartBytes {
+		need = MinStartBytes
+	}
+	if rate := e.m.Throughput(); rate > 0 && rate < bps && e.total > 0 {
+		rem := e.total - pos
+		extra := int64(float64(rem) * (1 - rate/bps))
+		extra = min(extra, int64(maxPrebufferSeconds*bps))
+		need = max(need, extra)
+	}
+	return need
+}
+
+func (e *Entry) bufferedLocked(pos int64, secs float64) bool {
+	if e.done || (e.total >= 0 && e.written >= e.total) {
+		return true
+	}
+	return e.written-pos >= e.needLocked(pos, secs)
+}
+
 // Wait blocks until at least n bytes are available, the download finishes,
 // or ctx is cancelled.
 func (e *Entry) Wait(ctx context.Context, n int64) error {
+	return e.waitFor(ctx, func() bool { return e.written >= n || e.done }, n)
+}
+
+// WaitStart blocks until enough of the track is downloaded to start
+// playback without stuttering (see StartSeconds), the download finishes, or
+// ctx is cancelled.
+func (e *Entry) WaitStart(ctx context.Context) error {
+	return e.waitFor(ctx, func() bool { return e.bufferedLocked(0, StartSeconds) }, 1)
+}
+
+func (e *Entry) waitFor(ctx context.Context, ok func() bool, n int64) error {
 	stop := context.AfterFunc(ctx, func() {
 		e.mu.Lock()
 		e.cond.Broadcast()
 		e.mu.Unlock()
 	})
 	defer stop()
+	defer e.pollWhileWaiting()()
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	for e.written < n && !e.done {
+	for !ok() {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -436,160 +627,26 @@ func (e *Entry) Wait(ctx context.Context, n int64) error {
 	return nil
 }
 
-func (e *Entry) setErr(err error) {
-	e.mu.Lock()
-	e.err = err
-	e.done = true
-	e.cond.Broadcast()
-	e.mu.Unlock()
-	close(e.doneCh)
-}
-
-func (e *Entry) download(ctx context.Context) {
-	m := e.m
-	// Low-priority downloads wait until no high-priority download is active.
-	m.mu.Lock()
-	for e.prio == Low && m.highBusy > 0 && ctx.Err() == nil && !m.closed {
-		waitCond(ctx, m.cond)
-	}
-	high := e.prio == High
-	if high {
-		m.highBusy++
-	}
-	src := m.src
-	m.mu.Unlock()
-	defer func() {
-		if high {
-			m.mu.Lock()
-			m.highBusy--
-			m.cond.Broadcast()
-			m.mu.Unlock()
+// pollWhileWaiting wakes cond waiters periodically, because thresholds
+// that depend on the measured throughput change without a signal. It
+// returns the function that stops polling.
+func (e *Entry) pollWhileWaiting() func() {
+	stop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(250 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				e.mu.Lock()
+				e.cond.Broadcast()
+				e.mu.Unlock()
+			}
 		}
 	}()
-	if ctx.Err() != nil {
-		e.setErr(ctx.Err())
-		return
-	}
-	if src == nil {
-		e.setErr(errors.New("not connected to a server"))
-		return
-	}
-
-	var lastErr error
-	for attempt := 0; attempt < 4; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-time.After(time.Duration(attempt) * time.Second):
-			case <-ctx.Done():
-				e.setErr(ctx.Err())
-				return
-			}
-		}
-		err := e.fetch(ctx, src)
-		if err == nil {
-			final := m.finalPath(e.key)
-			if err := os.Rename(e.path, final); err != nil {
-				e.setErr(err)
-				return
-			}
-			e.mu.Lock()
-			e.path = final
-			e.done = true
-			e.total = e.written
-			e.cond.Broadcast()
-			e.mu.Unlock()
-			close(e.doneCh)
-			go m.evict()
-			return
-		}
-		lastErr = err
-		if ctx.Err() != nil {
-			break
-		}
-		var he interface{ Error() string }
-		if errors.As(err, &he) && strings.Contains(err.Error(), "HTTP error: 4") {
-			break // client errors won't get better by retrying
-		}
-	}
-	e.setErr(lastErr)
-}
-
-func waitCond(ctx context.Context, c *sync.Cond) {
-	stop := context.AfterFunc(ctx, func() {
-		c.L.Lock()
-		c.Broadcast()
-		c.L.Unlock()
-	})
-	c.Wait()
-	stop()
-}
-
-// fetch downloads (or resumes) into the .part file.
-func (e *Entry) fetch(ctx context.Context, src Source) error {
-	f, err := os.OpenFile(e.path, os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	offset := fi.Size()
-	format := e.req.Format
-	if format == "" {
-		format = "raw" // original file, no server-side transcoding
-	}
-	resp, err := src.Stream(ctx, e.req.ID, format, e.req.BitRate, offset)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if offset > 0 && resp.StatusCode != http.StatusPartialContent {
-		offset = 0 // server ignored Range; restart
-	}
-	if err := f.Truncate(offset); err != nil {
-		return err
-	}
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return err
-	}
-	total := int64(-1)
-	if resp.ContentLength >= 0 {
-		total = offset + resp.ContentLength
-	}
-	e.mu.Lock()
-	e.written = offset
-	e.total = total
-	e.cond.Broadcast()
-	e.mu.Unlock()
-
-	buf := make([]byte, 64<<10)
-	for {
-		n, rerr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, err := f.Write(buf[:n]); err != nil {
-				return err
-			}
-			e.mu.Lock()
-			e.written += int64(n)
-			e.cond.Broadcast()
-			e.mu.Unlock()
-		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			return rerr
-		}
-	}
-	e.mu.Lock()
-	short := e.total >= 0 && e.written < e.total
-	e.mu.Unlock()
-	if short {
-		return io.ErrUnexpectedEOF
-	}
-	return f.Sync()
+	return func() { close(stop) }
 }
 
 // Open returns a reader over the entry. Reads past the downloaded part block
@@ -599,14 +656,22 @@ func (e *Entry) Open() (*Reader, error) {
 	path := e.path
 	e.mu.Unlock()
 	f, err := os.Open(path)
-	if err != nil {
-		// The .part file may have been renamed between reading path and open.
+	if errors.Is(err, os.ErrNotExist) {
+		// The .part file may have been renamed between reading path and
+		// open, or not created yet.
 		e.mu.Lock()
 		path = e.path
 		e.mu.Unlock()
-		if f, err = os.Open(path); err != nil {
-			return nil, err
+		f, err = os.OpenFile(path, os.O_RDONLY|os.O_CREATE, 0o600)
+		if err != nil {
+			e.mu.Lock()
+			path = e.path
+			e.mu.Unlock()
+			f, err = os.Open(path)
 		}
+	}
+	if err != nil {
+		return nil, err
 	}
 	e.mu.Lock()
 	e.readers++
@@ -626,7 +691,9 @@ type Reader struct {
 	WaitHook func(waiting bool)
 }
 
-// Read implements io.Reader.
+// Read implements io.Reader. A read that catches up with the download
+// waits until ResumeSeconds of audio (more on slow links) is available
+// again, so playback resumes with a healthy buffer instead of stuttering.
 func (r *Reader) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -634,15 +701,19 @@ func (r *Reader) Read(p []byte) (int, error) {
 	e := r.e
 	e.mu.Lock()
 	waited := false
-	for r.pos >= e.written && !e.done && !r.interrupted && !r.closed {
-		if !waited && r.WaitHook != nil {
-			waited = true
+	if r.pos >= e.written && !e.done && !r.interrupted && !r.closed {
+		if r.WaitHook != nil {
 			e.mu.Unlock()
 			r.WaitHook(true)
 			e.mu.Lock()
-			continue
 		}
-		e.cond.Wait()
+		waited = true
+		slog.Debug("cache: reader waiting for data", "key", e.key, "pos", r.pos, "written", e.written)
+		stop := e.pollWhileWaiting()
+		for !e.bufferedLocked(r.pos, ResumeSeconds) && !r.interrupted && !r.closed {
+			e.cond.Wait()
+		}
+		stop()
 	}
 	avail := e.written - r.pos
 	done, derr := e.done, e.err
@@ -671,6 +742,11 @@ func (r *Reader) Read(p []byte) (int, error) {
 	if err == io.EOF && n > 0 {
 		err = nil
 	}
+	e.mu.Lock()
+	if r.pos > e.readPos {
+		e.readPos = r.pos
+	}
+	e.mu.Unlock()
 	return n, err
 }
 
@@ -704,6 +780,10 @@ func (r *Reader) Seek(offset int64, whence int) (int64, error) {
 		return r.pos, errors.New("negative position")
 	}
 	r.pos = npos
+	e := r.e
+	e.mu.Lock()
+	e.readPos = npos // seeking resets the play position used for health
+	e.mu.Unlock()
 	return npos, nil
 }
 

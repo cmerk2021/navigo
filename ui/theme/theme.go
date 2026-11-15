@@ -45,6 +45,7 @@ var (
 	Divider       = color.NRGBA{R: 255, G: 255, B: 255, A: 22}
 	SeekTrack     = color.NRGBA{R: 255, G: 255, B: 255, A: 64}
 	SeekBuffered  = color.NRGBA{R: 255, G: 255, B: 255, A: 110}
+	SeekShimmer   = color.NRGBA{R: 255, G: 255, B: 255, A: 120}
 	ErrorColor    = color.NRGBA{R: 0xFF, G: 0x6B, B: 0x5E, A: 255}
 	MenuBG        = color.NRGBA{R: 0x22, G: 0x22, B: 0x24, A: 250}
 )
