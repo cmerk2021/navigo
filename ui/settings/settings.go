@@ -27,6 +27,8 @@ import (
 var (
 	cacheSizes = []int{512, 1024, 2048, 4096, 8192, 16384}
 	bitrates   = []int{128, 192, 256, 320}
+	rgModes    = []string{config.ReplayGainOff, config.ReplayGainTrack, config.ReplayGainAlbum}
+	rgLabels   = []string{"Off", "Track", "Album"}
 	swatches   = []string{"", "#F2490C", "#3D8BFD", "#2EBD85", "#A970FF", "#FF4F8B", "#F5B400"}
 )
 
@@ -40,11 +42,14 @@ type Panel struct {
 	testBtn, saveBtn, clearBt widgets.PillButton
 	backPill                  widgets.PillButton
 	insecure, modeBtns, kdeAc widgets.Toggle
-	rg, scrobble, separate    widgets.Toggle
+	scrobble, separate        widgets.Toggle
+	rg                        widgets.Dropdown
 	cacheMinus, cachePlus     widgets.RoundButton
 	bitrate                   widgets.Segmented
 	swatchBtns                []widget.Clickable
 	list                      widget.List
+	rowH                      []int // last laid-out height of each row
+	curRow                    int
 
 	mu        sync.Mutex
 	status    string
@@ -81,6 +86,12 @@ func (p *Panel) refreshCacheUsage() {
 		p.e.Invalidate()
 	}()
 }
+
+// HandleEsc implements env.EscHandler by closing an open dropdown.
+func (p *Panel) HandleEsc() bool { return p.rg.Close() }
+
+// Closed implements env.Closer.
+func (p *Panel) Closed() { p.rg.Close() }
 
 // CapturesKeys reports that the panel has text input.
 func (p *Panel) CapturesKeys() bool { return true }
@@ -393,7 +404,45 @@ func (p *Panel) Layout(gtx layout.Context) layout.Dimensions {
 			})
 			return layout.Dimensions{Size: image.Pt(w, h)}
 		},
-		toggleRow("ReplayGain", "Use track gain tags when available", &p.rg, c.ReplayGain, func(c *config.Config, v bool) { c.ReplayGain = v }),
+		func(gtx layout.Context) layout.Dimensions {
+			w := gtx.Constraints.Max.X
+			h := gtx.Dp(54)
+			dw := gtx.Dp(120)
+			theme.BoxLoose(gtx, image.Rect(0, 0, w-dw-gtx.Dp(10), h), func(gtx layout.Context) layout.Dimensions {
+				gtx.Constraints.Min.Y = gtx.Constraints.Max.Y
+				return theme.W(gtx, func(gtx layout.Context) layout.Dimensions {
+					return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return th.Text(gtx, "ReplayGain", theme.BodySize, font.Normal, theme.White)
+						}),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return th.Text(gtx, "Normalize volume using gain tags", theme.CaptionSize, font.Normal, theme.TextTertiary)
+						}),
+					)
+				})
+			})
+			sel := 0
+			for i, m := range rgModes {
+				if m == c.ReplayGainMode {
+					sel = i
+				}
+			}
+			dh := gtx.Dp(theme.SegmentHeight)
+			// Open upwards if the list would run past the panel bottom.
+			y := top - p.list.Position.Offset
+			for j := p.list.Position.First; j < p.curRow && j < len(p.rowH); j++ {
+				y += p.rowH[j]
+			}
+			p.rg.Up = y+(h+dh)/2+widgets.DropdownListHeight(gtx, len(rgLabels)) > sz.Y-gtx.Dp(8)
+			theme.Box(gtx, theme.Rect(w-dw, (h-dh)/2, dw, dh), func(gtx layout.Context) layout.Dimensions {
+				if p.rg.Layout(gtx, th, rgLabels, &sel) {
+					v := rgModes[sel]
+					p.update(func(c *config.Config) { c.ReplayGainMode = v })
+				}
+				return layout.Dimensions{Size: gtx.Constraints.Min}
+			})
+			return layout.Dimensions{Size: image.Pt(w, h)}
+		},
 		toggleRow("Scrobbling", "Report plays to the server", &p.scrobble, c.Scrobble, func(c *config.Config, v bool) { c.Scrobble = v }),
 
 		heading("Cache"),
@@ -451,8 +500,14 @@ func (p *Panel) Layout(gtx layout.Context) layout.Dimensions {
 		space(12),
 	}
 	theme.Box(gtx, image.Rect(pad, top, sz.X-pad, sz.Y-gtx.Dp(8)), func(gtx layout.Context) layout.Dimensions {
+		if len(p.rowH) != len(rows) {
+			p.rowH = make([]int, len(rows))
+		}
 		return p.list.Layout(gtx, len(rows), func(gtx layout.Context, i int) layout.Dimensions {
-			return rows[i](gtx)
+			p.curRow = i
+			d := rows[i](gtx)
+			p.rowH[i] = d.Size.Y
+			return d
 		})
 	})
 	return layout.Dimensions{Size: sz}

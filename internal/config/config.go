@@ -22,6 +22,13 @@ const (
 	ModeCompact = "compact"
 )
 
+// ReplayGain mode values.
+const (
+	ReplayGainOff   = "off"
+	ReplayGainTrack = "track"
+	ReplayGainAlbum = "album"
+)
+
 // EQConfig is the persisted equalizer state.
 type EQConfig struct {
 	eq.Settings
@@ -41,14 +48,16 @@ type Config struct {
 	PasswordInKeyring bool   `json:"passwordInKeyring"`
 	InsecureTLS       bool   `json:"insecureTls"`
 
-	ShowModeButtons      bool   `json:"showModeButtons"`
-	FollowKDEAccent      bool   `json:"followKdeAccent"`
-	AccentOverride       string `json:"accentOverride"`
-	CacheSizeMB          int    `json:"cacheSizeMb"`
-	TranscodeBitrate     int    `json:"transcodeBitrate"`
-	ReplayGain           bool   `json:"replayGain"`
-	Scrobble             bool   `json:"scrobble"`
-	PanelsSeparateWindow bool   `json:"panelsSeparateWindow"`
+	ShowModeButtons  bool   `json:"showModeButtons"`
+	FollowKDEAccent  bool   `json:"followKdeAccent"`
+	AccentOverride   string `json:"accentOverride"`
+	CacheSizeMB      int    `json:"cacheSizeMb"`
+	TranscodeBitrate int    `json:"transcodeBitrate"`
+	ReplayGainMode   string `json:"replayGainMode"`
+	// ReplayGain is the legacy on/off setting, migrated to ReplayGainMode.
+	ReplayGain           bool `json:"replayGain,omitempty"`
+	Scrobble             bool `json:"scrobble"`
+	PanelsSeparateWindow bool `json:"panelsSeparateWindow"`
 
 	Mode         string  `json:"mode"`
 	HasWindowPos bool    `json:"hasWindowPos"`
@@ -66,6 +75,7 @@ func Default() *Config {
 		ShowModeButtons:  true,
 		CacheSizeMB:      2048,
 		TranscodeBitrate: 320,
+		ReplayGainMode:   ReplayGainOff,
 		Scrobble:         true,
 		Mode:             ModeNormal,
 		Volume:           1.0,
@@ -135,6 +145,14 @@ func (c *Config) sanitize() {
 	}
 	if c.TranscodeBitrate <= 0 {
 		c.TranscodeBitrate = 320
+	}
+	if c.ReplayGain {
+		c.ReplayGainMode, c.ReplayGain = ReplayGainTrack, false
+	}
+	switch c.ReplayGainMode {
+	case ReplayGainOff, ReplayGainTrack, ReplayGainAlbum:
+	default:
+		c.ReplayGainMode = ReplayGainOff
 	}
 	if c.Mode != ModeCompact {
 		c.Mode = ModeNormal

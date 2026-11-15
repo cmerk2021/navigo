@@ -102,10 +102,10 @@ func (l *loopDec) Close() error  { return nil }
 // open. Blocking reads are aborted when ctx is cancelled. If the source has a
 // SetWaitHook method, onWait is installed once the decoder is open, so that
 // stalls during playback (not while pre-opening) are reported.
-func FromSource(id, hint string, gain float32, open func(ctx context.Context) (Source, error), onWait func(bool)) *Media {
+func FromSource(id, hint string, rg ReplayGain, open func(ctx context.Context) (Source, error), onWait func(bool)) *Media {
 	return &Media{
-		ID:   id,
-		Gain: gain,
+		ID:         id,
+		ReplayGain: rg,
 		Open: func(ctx context.Context) (Decoder, error) {
 			src, err := open(ctx)
 			if err != nil {

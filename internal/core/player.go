@@ -113,6 +113,7 @@ func New(cfg *config.Config) *Player {
 	p.covers = cache.NewCovers(filepath.Join(config.CacheDir(), "covers"), 256)
 	p.eng.SetVolume(cfg.Volume)
 	p.eng.SetMuted(cfg.Muted)
+	p.eng.SetReplayGainMode(replayGainMode(cfg.ReplayGainMode))
 	p.eng.EQ().SetSettings(cfg.EQ.Settings)
 	return p
 }
@@ -233,6 +234,9 @@ func (p *Player) UpdateConfig(f func(c *config.Config)) {
 	if cfg.CacheSizeMB != old.CacheSizeMB {
 		p.tracks.SetMaxBytes(int64(cfg.CacheSizeMB) << 20)
 	}
+	if cfg.ReplayGainMode != old.ReplayGainMode {
+		p.eng.SetReplayGainMode(replayGainMode(cfg.ReplayGainMode))
+	}
 	if cfg.EQ.Settings != old.EQ.Settings {
 		p.eng.EQ().SetSettings(cfg.EQ.Settings)
 	}
@@ -316,20 +320,30 @@ func (p *Player) requestFor(s subsonic.Song, transcode bool) (cache.Request, boo
 	return cache.Request{ID: s.ID}, false
 }
 
-func replayGain(s subsonic.Song) float32 {
-	rg := s.ReplayGain
-	if rg == nil || (rg.TrackGain == 0 && rg.AlbumGain == 0) {
-		return 1
+// replayGain converts server-reported ReplayGain values. A gain and peak of
+// zero means the server has no value, so the file's tags are used instead.
+func replayGain(s subsonic.Song) audio.ReplayGain {
+	var rg audio.ReplayGain
+	if r := s.ReplayGain; r != nil {
+		if r.TrackGain != 0 || r.TrackPeak != 0 {
+			rg.TrackGain, rg.TrackPeak, rg.HasTrack = r.TrackGain, r.TrackPeak, true
+		}
+		if r.AlbumGain != 0 || r.AlbumPeak != 0 {
+			rg.AlbumGain, rg.AlbumPeak, rg.HasAlbum = r.AlbumGain, r.AlbumPeak, true
+		}
 	}
-	g, peak := rg.TrackGain, rg.TrackPeak
-	if g == 0 {
-		g, peak = rg.AlbumGain, rg.AlbumPeak
+	return rg
+}
+
+// replayGainMode maps a config value to the engine mode.
+func replayGainMode(s string) audio.ReplayGainMode {
+	switch s {
+	case config.ReplayGainTrack:
+		return audio.ReplayGainTrack
+	case config.ReplayGainAlbum:
+		return audio.ReplayGainAlbum
 	}
-	lin := math.Pow(10, g/20)
-	if peak > 0 && lin*peak > 1 {
-		lin = 1 / peak
-	}
-	return float32(lin)
+	return audio.ReplayGainOff
 }
 
 func (p *Player) newToken(id string) string {
@@ -343,16 +357,12 @@ func (p *Player) mediaFor(s subsonic.Song, req cache.Request, transcoded bool, p
 	if transcoded {
 		hint = req.Format
 	}
-	gain := float32(1)
-	if p.cfg.ReplayGain {
-		gain = replayGain(s)
-	}
 	entry := p.tracks.Get(req, prio)
 	var onWait func(bool)
 	if hook {
 		onWait = p.eng.SetBuffering
 	}
-	m := audio.FromSource(tok, hint, gain, func(ctx context.Context) (audio.Source, error) {
+	m := audio.FromSource(tok, hint, replayGain(s), func(ctx context.Context) (audio.Source, error) {
 		e := p.tracks.Get(req, cache.High)
 		// Start playing once ~1-2 s (or the whole file) is available.
 		if err := e.Wait(ctx, 256<<10); err != nil {

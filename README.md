@@ -171,6 +171,13 @@ Audio is resampled to 44.1 kHz stereo float. One continuous output stream
 carries the mixer chain (decoder → ReplayGain → EQ → preamp → soft limiter →
 volume), so track changes are gapless and the EQ state is never reset.
 
+**ReplayGain** (*Settings → ReplayGain*: Off / Track / Album) normalizes
+loudness. Values reported by the server (OpenSubsonic `replayGain`) are used
+first; missing ones are read from the file's tags (`REPLAYGAIN_*` Vorbis
+comments in FLAC/Ogg, ID3v2 `TXXX` frames in MP3). Album mode falls back to
+the track gain and vice versa, and the gain is reduced if the tagged peak
+would clip. Untagged tracks play unchanged.
+
 ## Cache locations
 
 | What | Where |
