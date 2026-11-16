@@ -1,4 +1,5 @@
-// Package queue implements the queue panel.
+// Package queue implements the queue panel. Tracks are listed in play
+// order; upcoming tracks added with "Add to queue" are marked.
 package queue
 
 import (
@@ -47,18 +48,18 @@ func (p *Panel) Layout(gtx layout.Context) layout.Dimensions {
 	if widgets.PanelHeader(gtx, th, "Queue", &p.closeBtn) {
 		p.e.Close()
 	}
-	songs, cur := pl.QueueView()
-	if len(p.rows) != len(songs) {
-		p.rows = make([]widget.Clickable, len(songs))
-		p.removes = make([]widgets.RoundButton, len(songs))
+	entries, cur := pl.QueueEntries()
+	if len(p.rows) != len(entries) {
+		p.rows = make([]widget.Clickable, len(entries))
+		p.removes = make([]widgets.RoundButton, len(entries))
 	}
 	jump, remove := -1, -1
 	for i := range p.rows {
 		if p.rows[i].Clicked(gtx) {
-			jump = i
+			jump = entries[i].Index
 		}
 		if p.removes[i].Clicked(gtx) {
-			remove = i
+			remove = entries[i].Index
 		}
 	}
 	if remove >= 0 {
@@ -74,7 +75,7 @@ func (p *Panel) Layout(gtx layout.Context) layout.Dimensions {
 	top := pad + gtx.Dp(theme.PanelHeaderH) + gtx.Dp(8)
 	bh := gtx.Dp(theme.PillButtonHeight)
 	bottom := sz.Y - pad - bh - gtx.Dp(12)
-	if len(songs) == 0 {
+	if len(entries) == 0 {
 		theme.Box(gtx, image.Rect(pad, top, sz.X-pad, bottom), func(gtx layout.Context) layout.Dimensions {
 			return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 				gtx.Constraints.Min = image.Point{}
@@ -89,8 +90,12 @@ func (p *Panel) Layout(gtx layout.Context) layout.Dimensions {
 		}
 		rh := gtx.Dp(theme.RowHeight)
 		theme.Box(gtx, image.Rect(pad/2, top, sz.X-pad/2, bottom), func(gtx layout.Context) layout.Dimensions {
-			return p.list.Layout(gtx, len(songs), func(gtx layout.Context, i int) layout.Dimensions {
-				s := songs[i]
+			return p.list.Layout(gtx, len(entries), func(gtx layout.Context, i int) layout.Dimensions {
+				s := entries[i].Song
+				sub := s.Artist + " · " + widgets.FormatDuration(s.DurationTime())
+				if entries[i].Queued {
+					sub = "In queue · " + sub
+				}
 				w := gtx.Constraints.Max.X
 				gtx.Constraints = layout.Exact(image.Pt(w, rh))
 				p.rows[i].Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -117,7 +122,7 @@ func (p *Panel) Layout(gtx layout.Context) layout.Dimensions {
 						return th.Text(gtx, s.Title, theme.BodySize, font.SemiBold, col)
 					})
 					theme.BoxLoose(gtx, image.Rect(tx, gtx.Dp(26), tx+tw, rh), func(gtx layout.Context) layout.Dimensions {
-						return th.Text(gtx, s.Artist+" · "+widgets.FormatDuration(s.DurationTime()), theme.CaptionSize, font.Normal, theme.TextSecondary)
+						return th.Text(gtx, sub, theme.CaptionSize, font.Normal, theme.TextSecondary)
 					})
 					defer clip.Rect(r).Push(gtx.Ops).Pop()
 					pointer.CursorPointer.Add(gtx.Ops)
@@ -133,7 +138,7 @@ func (p *Panel) Layout(gtx layout.Context) layout.Dimensions {
 	}
 	bw := gtx.Dp(120)
 	theme.Box(gtx, theme.Rect((sz.X-bw)/2, sz.Y-pad-bh, bw, bh), func(gtx layout.Context) layout.Dimensions {
-		return p.clearBtn.LayoutColor(gtx, th, "Clear", false, len(songs) > 0)
+		return p.clearBtn.LayoutColor(gtx, th, "Clear", false, len(entries) > 0)
 	})
 	return layout.Dimensions{Size: sz}
 }

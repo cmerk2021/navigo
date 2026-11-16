@@ -43,6 +43,7 @@ type Panel struct {
 	backPill                  widgets.PillButton
 	insecure, modeBtns, kdeAc widgets.Toggle
 	scrobble, separate        widgets.Toggle
+	autoplay                  widgets.Toggle
 	rg                        widgets.Dropdown
 	cacheMinus, cachePlus     widgets.RoundButton
 	bitrate                   widgets.Segmented
@@ -444,6 +445,7 @@ func (p *Panel) Layout(gtx layout.Context) layout.Dimensions {
 			return layout.Dimensions{Size: image.Pt(w, h)}
 		},
 		toggleRow("Scrobbling", "Report plays to the server", &p.scrobble, c.Scrobble, func(c *config.Config, v bool) { c.Scrobble = v }),
+		toggleRow("Autoplay", "Play similar music when the queue ends", &p.autoplay, c.Autoplay, func(c *config.Config, v bool) { c.Autoplay = v }),
 
 		heading("Cache"),
 		func(gtx layout.Context) layout.Dimensions {

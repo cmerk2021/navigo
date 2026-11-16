@@ -69,12 +69,17 @@ type Panel struct {
 	seg      widgets.Segmented
 	connect  widgets.PillButton
 
+	shuffleAll    widgets.PillButton
+	artistPlay    widgets.RoundButton
+	artistShuffle widgets.RoundButton
+	ctx           ctxMenu
+
 	list      layout.List
 	positions [numTabs]layout.Position
 	view      viewKey
 
 	cells  map[string]*cell
-	tracks map[string]*widget.Clickable
+	tracks map[string]*trackRow
 
 	focusNext     bool
 	lastText      string
@@ -93,7 +98,7 @@ func New(e *env.Env) *Panel {
 	p := &Panel{
 		e:      e,
 		cells:  map[string]*cell{},
-		tracks: map[string]*widget.Clickable{},
+		tracks: map[string]*trackRow{},
 	}
 	p.list.Axis = layout.Vertical
 	p.field.SingleLine = true
@@ -108,6 +113,7 @@ func New(e *env.Env) *Panel {
 // Opened focuses the search field and refreshes stale data.
 func (p *Panel) Opened() {
 	p.focusNext = true
+	p.closeCtx()
 	c := p.e.Player.Client()
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -144,6 +150,9 @@ func (p *Panel) CapturesKeys() bool { return true }
 // HandleEsc leaves the artist sub-view or clears the search; it returns false
 // when there is nothing to undo so the shell closes the panel.
 func (p *Panel) HandleEsc() bool {
+	if p.closeCtx() {
+		return true
+	}
 	if p.closeArtist() {
 		return true
 	}
@@ -186,7 +195,7 @@ func (p *Panel) Layout(gtx layout.Context) layout.Dimensions {
 		p.cells = map[string]*cell{}
 	}
 	if len(p.tracks) > 3000 {
-		p.tracks = map[string]*widget.Clickable{}
+		p.tracks = map[string]*trackRow{}
 	}
 
 	c := p.e.Player.Client()
@@ -225,11 +234,13 @@ func (p *Panel) Layout(gtx layout.Context) layout.Dimensions {
 			return layout.Dimensions{Size: segR.Size()}
 		})
 		if changed {
+			p.closeCtx()
 			p.tabChanged()
 		}
 
 		p.layoutContent(gtx, image.Rect(pad, segR.Max.Y+gap, sz.X-pad, sz.Y-pad))
 	}
+	p.layoutCtx(gtx, sz)
 
 	actions := p.actions
 	p.actions = nil
@@ -340,9 +351,11 @@ func (p *Panel) layoutContent(gtx layout.Context, r image.Rectangle) {
 	p.mu.Lock()
 	vk := viewKey{tab: tab(p.tab)}
 	artistName := ""
+	artistPlayable := false
 	if p.d.artist != nil {
 		vk.artist = p.d.artist.id
 		artistName = p.d.artist.name
+		artistPlayable = len(p.d.artist.albums) > 0
 	} else if q != "" {
 		vk.search, vk.query = true, q
 	}
@@ -385,7 +398,7 @@ func (p *Panel) layoutContent(gtx layout.Context, r image.Rectangle) {
 
 	if vk.artist != "" {
 		bh := gtx.Dp(30)
-		p.layoutBack(gtx, theme.Rect(r.Min.X, r.Min.Y, r.Dx(), bh), artistName)
+		p.layoutBack(gtx, theme.Rect(r.Min.X, r.Min.Y, r.Dx(), bh), item{kind: kindArtist, id: vk.artist, title: artistName}, artistPlayable)
 		r.Min.Y += bh + gtx.Dp(4)
 	}
 
@@ -421,14 +434,35 @@ func (p *Panel) layoutContent(gtx layout.Context, r image.Rectangle) {
 	}
 }
 
-// layoutBack draws the "‹ Artist name" row of the artist sub-view.
-func (p *Panel) layoutBack(gtx layout.Context, r image.Rectangle, name string) {
+// layoutBack draws the "‹ Artist name" row of the artist sub-view, with
+// buttons that play or shuffle all of the artist's songs.
+func (p *Panel) layoutBack(gtx layout.Context, r image.Rectangle, artist item, playable bool) {
 	th := p.e.Theme
+	name := artist.title
 	if p.back.Clicked(gtx) {
 		p.actions = append(p.actions, func() { p.closeArtist() })
 	}
+	if p.artistPlay.Clicked(gtx) {
+		p.actions = append(p.actions, func() { p.playItem(artist, false) })
+	}
+	if p.artistShuffle.Clicked(gtx) {
+		p.actions = append(p.actions, func() { p.playItem(artist, true) })
+	}
+	bs := r.Dy()
+	btns := 0
+	if playable {
+		btns = 2*bs + gtx.Dp(6)
+		x := r.Max.X - btns
+		theme.Box(gtx, theme.Rect(x, r.Min.Y, bs, bs), func(gtx layout.Context) layout.Dimensions {
+			return p.artistPlay.Layout(gtx, th, theme.IconPlay, widgets.StyleAccent, 0.5)
+		})
+		theme.Box(gtx, theme.Rect(x+bs+gtx.Dp(6), r.Min.Y, bs, bs), func(gtx layout.Context) layout.Dimensions {
+			return p.artistShuffle.Layout(gtx, th, theme.IconShuffle, widgets.StyleGlass, 0.5)
+		})
+		btns += gtx.Dp(8)
+	}
 	is := gtx.Dp(18)
-	tw := min(th.Measure(gtx, name, theme.BodySize, font.SemiBold), r.Dx()-is-gtx.Dp(16))
+	tw := min(th.Measure(gtx, name, theme.BodySize, font.SemiBold), r.Dx()-is-gtx.Dp(16)-btns)
 	w := is + gtx.Dp(12) + tw
 	theme.Box(gtx, theme.Rect(r.Min.X, r.Min.Y, w, r.Dy()), func(gtx layout.Context) layout.Dimensions {
 		return p.back.Layout(gtx, func(gtx layout.Context) layout.Dimensions {

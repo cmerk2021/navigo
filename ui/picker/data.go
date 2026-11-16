@@ -3,6 +3,10 @@ package picker
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
+	"sort"
+	"sync"
 	"time"
 
 	"github.com/cmerk2021/navigo/internal/subsonic"
@@ -382,7 +386,74 @@ func (p *Panel) finishPlay(songs []subsonic.Song, start int, shuffle bool, err e
 	p.e.Invalidate()
 }
 
-// playItem plays an album or playlist, replacing the queue.
+// songsFor fetches the songs of an album, a playlist or an artist (all
+// albums, oldest first).
+func songsFor(ctx context.Context, c *subsonic.Client, it item) ([]subsonic.Song, error) {
+	switch it.kind {
+	case kindAlbum:
+		a, err := c.GetAlbum(ctx, it.id)
+		if err != nil {
+			return nil, err
+		}
+		return a.Song, nil
+	case kindPlaylist:
+		pl, err := c.GetPlaylist(ctx, it.id)
+		if err != nil {
+			return nil, err
+		}
+		return pl.Entry, nil
+	default:
+		return artistSongs(ctx, c, it.id)
+	}
+}
+
+// artistSongs fetches the songs of all albums of an artist.
+func artistSongs(ctx context.Context, c *subsonic.Client, id string) ([]subsonic.Song, error) {
+	a, err := c.GetArtist(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	albums := a.Album
+	year := func(y int) int {
+		if y <= 0 {
+			return math.MaxInt
+		}
+		return y
+	}
+	sort.SliceStable(albums, func(i, j int) bool { return year(albums[i].Year) < year(albums[j].Year) })
+	res := make([][]subsonic.Song, len(albums))
+	errs := make([]error, len(albums))
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for i, al := range albums {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if a, err := c.GetAlbum(ctx, al.ID); err != nil {
+				errs[i] = err
+			} else {
+				res[i] = a.Song
+			}
+		}()
+	}
+	wg.Wait()
+	var out []subsonic.Song
+	for _, s := range res {
+		out = append(out, s...)
+	}
+	if len(out) == 0 {
+		for _, err := range errs {
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return out, nil
+}
+
+// playItem plays an album, playlist or artist, replacing the queue.
 func (p *Panel) playItem(it item, shuffle bool) {
 	c, ctx, cancel := p.beginBusy()
 	if c == nil {
@@ -390,21 +461,74 @@ func (p *Panel) playItem(it item, shuffle bool) {
 	}
 	go func() {
 		defer cancel()
-		var songs []subsonic.Song
-		var err error
-		switch it.kind {
-		case kindAlbum:
-			var a *subsonic.Album
-			if a, err = c.GetAlbum(ctx, it.id); err == nil {
-				songs = a.Song
-			}
-		case kindPlaylist:
-			var pl *subsonic.Playlist
-			if pl, err = c.GetPlaylist(ctx, it.id); err == nil {
-				songs = pl.Entry
-			}
-		}
+		songs, err := songsFor(ctx, c, it)
 		p.finishPlay(songs, 0, shuffle, err)
+	}()
+}
+
+// enqueue adds an item's songs (or a single song when it is nil) to the
+// play queue without closing the picker.
+func (p *Panel) enqueue(it *item, song subsonic.Song, next bool) {
+	c, ctx, cancel := p.beginBusy()
+	if c == nil {
+		return
+	}
+	go func() {
+		defer cancel()
+		songs, err := []subsonic.Song{song}, error(nil)
+		if it != nil {
+			songs, err = songsFor(ctx, c, *it)
+		}
+		p.mu.Lock()
+		p.d.busy--
+		p.d.version++
+		p.mu.Unlock()
+		switch {
+		case err != nil:
+			if !canceled(err) {
+				p.e.Toast(err.Error(), true)
+			}
+		case len(songs) == 0:
+			p.e.Toast("Nothing to add", true)
+		default:
+			p.e.Player.Enqueue(songs, next)
+			p.e.Toast(enqueueMessage(songs, next), false)
+		}
+		p.e.Invalidate()
+	}()
+}
+
+func enqueueMessage(songs []subsonic.Song, next bool) string {
+	what := fmt.Sprintf("%d songs", len(songs))
+	if len(songs) == 1 {
+		what = "“" + songs[0].Title + "”"
+	}
+	if next {
+		return what + " will play next"
+	}
+	return "Added " + what + " to the queue"
+}
+
+// shuffleLibrary plays the whole library shuffled.
+func (p *Panel) shuffleLibrary() {
+	c, ctx, cancel := p.beginBusy()
+	if c == nil {
+		return
+	}
+	go func() {
+		defer cancel()
+		err := p.e.Player.ShuffleLibrary(ctx)
+		p.mu.Lock()
+		p.d.busy--
+		p.d.version++
+		if err == nil {
+			p.d.closeReq = true
+		}
+		p.mu.Unlock()
+		if err != nil && !canceled(err) {
+			p.e.Toast(err.Error(), true)
+		}
+		p.e.Invalidate()
 	}()
 }
 
