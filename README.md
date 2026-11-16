@@ -113,6 +113,21 @@ server.
   thumbnail.
 * Panels (picker, queue, EQ, EQ Assistant, settings) open as a 370×600 view.
 
+### Playing music
+
+* In the picker, **right-click** an album, playlist, artist or track for
+  *Play*, *Shuffle*, *Play next* and *Add to queue*. Queued songs play before
+  the rest of the current album or playlist, like Spotify's queue. They show
+  as "In queue" in the Queue panel, which lists tracks in play order.
+* Artists can be played or shuffled as a whole (all their albums), from the
+  hover buttons, the right-click menu, or the buttons in the artist header.
+* **Shuffle library** (top of the Albums and Artists tabs) plays random songs
+  from your entire library and keeps adding more as it goes.
+* **Autoplay** (*Settings → Autoplay*, on by default): when the queue runs out,
+  Navigo keeps playing similar music (the server's similar songs, falling back
+  to random songs of the same genre, then random songs from the library).
+  Autoplay doesn't apply when Repeat is on.
+
 ### Keyboard shortcuts
 
 | Key | Action |

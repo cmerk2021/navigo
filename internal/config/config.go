@@ -55,8 +55,10 @@ type Config struct {
 	TranscodeBitrate int    `json:"transcodeBitrate"`
 	ReplayGainMode   string `json:"replayGainMode"`
 	// ReplayGain is the legacy on/off setting, migrated to ReplayGainMode.
-	ReplayGain           bool `json:"replayGain,omitempty"`
-	Scrobble             bool `json:"scrobble"`
+	ReplayGain bool `json:"replayGain,omitempty"`
+	Scrobble   bool `json:"scrobble"`
+	// Autoplay continues with similar music when the queue runs out.
+	Autoplay             bool `json:"autoplay"`
 	PanelsSeparateWindow bool `json:"panelsSeparateWindow"`
 
 	Mode         string  `json:"mode"`
@@ -77,6 +79,7 @@ func Default() *Config {
 		TranscodeBitrate: 320,
 		ReplayGainMode:   ReplayGainOff,
 		Scrobble:         true,
+		Autoplay:         true,
 		Mode:             ModeNormal,
 		Volume:           1.0,
 		EQ: EQConfig{

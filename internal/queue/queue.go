@@ -1,5 +1,9 @@
 // Package queue implements the play queue: ordered tracks, a current index,
 // true shuffle without immediate repeats and repeat modes, plus persistence.
+//
+// Tracks added with Insert form a Spotify-style "user queue": they play
+// right after the current track, ahead of the rest of the album/playlist,
+// in the order they were added.
 package queue
 
 import (
@@ -32,7 +36,9 @@ func (r Repeat) Next() Repeat { return (r + 1) % 3 }
 
 // Queue is a play queue. It is not safe for concurrent use.
 type Queue struct {
-	Tracks  []subsonic.Song
+	Tracks []subsonic.Song
+	// queued[i] marks Tracks[i] as added by the user and not played yet.
+	queued  []bool
 	order   []int // play order (indices into Tracks)
 	pos     int   // position in order, -1 if empty
 	shuffle bool
@@ -75,9 +81,10 @@ func (q *Queue) Current() (subsonic.Song, bool) {
 // the start track plays first and the rest are shuffled.
 func (q *Queue) Set(tracks []subsonic.Song, start int, shuffle bool) {
 	q.Tracks = append([]subsonic.Song(nil), tracks...)
+	q.queued = make([]bool, len(tracks))
 	q.shuffle = shuffle
+	q.order, q.pos = nil, -1
 	if len(tracks) == 0 {
-		q.order, q.pos = nil, -1
 		return
 	}
 	if start < 0 || start >= len(tracks) {
@@ -90,25 +97,44 @@ func (q *Queue) Set(tracks []subsonic.Song, start int, shuffle bool) {
 }
 
 // rebuild recomputes the play order so that track index cur is current.
+// Upcoming user-queued tracks keep their order right after cur.
 func (q *Queue) rebuild(cur int) {
 	n := len(q.Tracks)
-	q.order = make([]int, n)
-	if !q.shuffle {
-		for i := range q.order {
-			q.order[i] = i
+	var up []int
+	if q.pos >= 0 && q.pos < len(q.order) {
+		for _, i := range q.order[q.pos+1:] {
+			if q.queued[i] && i != cur {
+				up = append(up, i)
+			}
 		}
-		q.pos = cur
+	}
+	isUp := make([]bool, n)
+	for _, i := range up {
+		isUp[i] = true
+	}
+	q.order = make([]int, 0, n)
+	if !q.shuffle {
+		for i := 0; i < n; i++ {
+			if isUp[i] {
+				continue
+			}
+			q.order = append(q.order, i)
+			if i == cur {
+				q.pos = len(q.order) - 1
+				q.order = append(q.order, up...)
+			}
+		}
 		return
 	}
-	q.order[0] = cur
-	k := 1
+	q.order = append(q.order, cur)
+	q.order = append(q.order, up...)
+	k := len(q.order)
 	for i := 0; i < n; i++ {
-		if i != cur {
-			q.order[k] = i
-			k++
+		if i != cur && !isUp[i] {
+			q.order = append(q.order, i)
 		}
 	}
-	rest := q.order[1:]
+	rest := q.order[k:]
 	rand.Shuffle(len(rest), func(i, j int) { rest[i], rest[j] = rest[j], rest[i] })
 	q.pos = 0
 }
@@ -127,6 +153,106 @@ func (q *Queue) SetShuffle(on bool) {
 		cur = 0
 	}
 	q.rebuild(cur)
+}
+
+// setPos makes order position p current; a user-queued track stops being
+// "queued" once it plays.
+func (q *Queue) setPos(p int) {
+	q.pos = p
+	if p >= 0 && p < len(q.order) {
+		q.queued[q.order[p]] = false
+	}
+}
+
+// Insert adds tracks to the user queue: after the current track and any
+// tracks queued before them (FIFO), or right after the current track when
+// next is true. Into an empty queue the tracks are added with the first one
+// current. It returns the number of tracks added.
+func (q *Queue) Insert(tracks []subsonic.Song, next bool) int {
+	if len(tracks) == 0 {
+		return 0
+	}
+	if q.pos < 0 || len(q.order) == 0 {
+		q.Set(tracks, 0, q.shuffle)
+		return len(tracks)
+	}
+	at := q.pos + 1
+	if !next {
+		for p := q.pos + 1; p < len(q.order); p++ {
+			if q.queued[q.order[p]] {
+				at = p + 1
+			}
+		}
+	}
+	q.insertAt(at, tracks, true)
+	return len(tracks)
+}
+
+// Append adds tracks at the end of the play order (e.g. autoplay).
+func (q *Queue) Append(tracks []subsonic.Song) {
+	if len(tracks) == 0 {
+		return
+	}
+	if q.pos < 0 || len(q.order) == 0 {
+		q.Set(tracks, 0, q.shuffle)
+		return
+	}
+	q.insertAt(len(q.order), tracks, false)
+}
+
+// insertAt inserts tracks so that they play at order position at (> pos).
+// In Tracks they go right after the track that precedes them in play order,
+// so without shuffle Tracks stays in play order.
+func (q *Queue) insertAt(at int, tracks []subsonic.Song, queued bool) {
+	k := len(tracks)
+	ti := q.order[at-1] + 1
+	q.Tracks = append(q.Tracks[:ti], append(append([]subsonic.Song(nil), tracks...), q.Tracks[ti:]...)...)
+	flags := make([]bool, k)
+	for i := range flags {
+		flags[i] = queued
+	}
+	q.queued = append(q.queued[:ti], append(flags, q.queued[ti:]...)...)
+	for p, i := range q.order {
+		if i >= ti {
+			q.order[p] = i + k
+		}
+	}
+	ins := make([]int, k)
+	for j := range ins {
+		ins[j] = ti + j
+	}
+	q.order = append(q.order[:at], append(ins, q.order[at:]...)...)
+}
+
+// Entry is a track in play order.
+type Entry struct {
+	Song subsonic.Song
+	// Index is the track's index for Jump and Remove.
+	Index int
+	// Queued is set for upcoming tracks added by the user.
+	Queued bool
+}
+
+// Entries returns the tracks in play order and the position of the current
+// one (-1 if none).
+func (q *Queue) Entries() ([]Entry, int) {
+	out := make([]Entry, len(q.order))
+	for p, i := range q.order {
+		out[p] = Entry{Song: q.Tracks[i], Index: i, Queued: q.queued[i] && p > q.pos}
+	}
+	if q.pos >= len(q.order) {
+		return out, -1
+	}
+	return out, q.pos
+}
+
+// Remaining returns the number of tracks after the current one in play
+// order (ignoring repeat).
+func (q *Queue) Remaining() int {
+	if q.pos < 0 {
+		return 0
+	}
+	return len(q.order) - q.pos - 1
 }
 
 // peek returns the order position after p, honouring repeat-all. Repeat-one
@@ -210,14 +336,14 @@ func (q *Queue) Advance(auto bool) bool {
 		}
 		if q.repeat != RepeatAll && !auto {
 			// Manual next at the end wraps around like most players.
-			q.pos = 0
+			q.setPos(0)
 			return true
 		}
 		q.reshuffleCycle()
-		q.pos = 0
+		q.setPos(0)
 		return true
 	}
-	q.pos++
+	q.setPos(q.pos + 1)
 	return true
 }
 
@@ -227,10 +353,10 @@ func (q *Queue) Previous() bool {
 		return false
 	}
 	if q.pos > 0 {
-		q.pos--
+		q.setPos(q.pos - 1)
 		return true
 	}
-	q.pos = len(q.order) - 1
+	q.setPos(len(q.order) - 1)
 	return true
 }
 
@@ -241,7 +367,7 @@ func (q *Queue) Jump(i int) bool {
 	}
 	for p, idx := range q.order {
 		if idx == i {
-			q.pos = p
+			q.setPos(p)
 			return true
 		}
 	}
@@ -257,6 +383,7 @@ func (q *Queue) Remove(i int) (removedCurrent bool) {
 	cur := q.Index()
 	removedCurrent = cur == i
 	q.Tracks = append(q.Tracks[:i], q.Tracks[i+1:]...)
+	q.queued = append(q.queued[:i], q.queued[i+1:]...)
 	newOrder := q.order[:0]
 	newPos := -1
 	for p, idx := range q.order {
@@ -285,12 +412,15 @@ func (q *Queue) Remove(i int) (removedCurrent bool) {
 	default:
 		q.pos = newPos
 	}
+	if removedCurrent && q.pos >= 0 {
+		q.setPos(q.pos)
+	}
 	return removedCurrent
 }
 
 // Clear empties the queue.
 func (q *Queue) Clear() {
-	q.Tracks, q.order, q.pos = nil, nil, -1
+	q.Tracks, q.queued, q.order, q.pos = nil, nil, nil, -1
 }
 
 // State is the persisted queue state.
@@ -301,6 +431,8 @@ type State struct {
 	Shuffle  bool            `json:"shuffle"`
 	Repeat   Repeat          `json:"repeat"`
 	Position time.Duration   `json:"position"`
+	// Queued flags user-queued tracks (parallel to Tracks).
+	Queued []bool `json:"queued,omitempty"`
 }
 
 // Snapshot returns the persistable state.
@@ -312,12 +444,17 @@ func (q *Queue) Snapshot(position time.Duration) State {
 		Shuffle:  q.shuffle,
 		Repeat:   q.repeat,
 		Position: position,
+		Queued:   append([]bool(nil), q.queued...),
 	}
 }
 
 // Restore loads a snapshot, validating it.
 func (q *Queue) Restore(s State) {
 	q.Tracks = s.Tracks
+	q.queued = make([]bool, len(s.Tracks))
+	if len(s.Queued) == len(s.Tracks) {
+		copy(q.queued, s.Queued)
+	}
 	q.shuffle = s.Shuffle
 	q.repeat = s.Repeat
 	if q.repeat < RepeatOff || q.repeat > RepeatOne {
@@ -338,7 +475,7 @@ func (q *Queue) Restore(s State) {
 		return
 	}
 	if !valid {
-		q.order = nil
+		q.order, q.pos = nil, -1
 		q.shuffle = false
 		q.rebuild(0)
 		return

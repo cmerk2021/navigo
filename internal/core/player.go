@@ -107,6 +107,13 @@ type Player struct {
 	artFor    string
 	preview   *previewState
 	dirty     atomic.Bool
+	// ended is set when playback stopped at the end of the queue.
+	ended bool
+	// Continuation (autoplay / library shuffle) when the queue runs out.
+	libraryMode bool
+	contGen     int
+	contBusy    bool
+	contTried   string // seed song that yielded nothing
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -252,6 +259,12 @@ func (p *Player) UpdateConfig(f func(c *config.Config)) {
 	if cfg.EQ.Settings != old.EQ.Settings {
 		p.eng.EQ().SetSettings(cfg.EQ.Settings)
 	}
+	if cfg.Autoplay && !old.Autoplay {
+		p.mu.Lock()
+		p.contTried = ""
+		p.maybeContinueLocked()
+		p.mu.Unlock()
+	}
 	if cfg.InsecureTLS != old.InsecureTLS && cfg.HasServer() {
 		if c, err := subsonic.New(cfg.ServerURL, cfg.Username, p.password(), cfg.InsecureTLS); err == nil {
 			p.setClient(c)
@@ -395,6 +408,7 @@ func (p *Player) mediaFor(s subsonic.Song, req cache.Request, transcoded bool, p
 
 // loadCurrentLocked loads the queue's current track into the engine.
 func (p *Player) loadCurrentLocked(pos time.Duration, paused, transcode bool) {
+	p.ended = false
 	s, ok := p.q.Current()
 	if !ok || p.client == nil {
 		p.eng.Stop()
@@ -450,6 +464,7 @@ func (p *Player) updateNextLocked() {
 	}
 	p.tracks.Pin(pins...)
 	p.tracks.Prefetch(reqs)
+	p.maybeContinueLocked()
 }
 
 // ---------------- event loop ----------------
@@ -517,6 +532,10 @@ func (p *Player) handleEvent(ev audio.Event) {
 		}
 		if p.q.Advance(true) {
 			p.loadCurrentLocked(0, false, false)
+		} else {
+			// A continuation that arrives later resumes playback.
+			p.ended = true
+			p.maybeContinueLocked()
 		}
 	case audio.EvError:
 		p.handleErrorLocked(ev)
@@ -737,11 +756,12 @@ func (p *Player) Snapshot() Snapshot {
 	return s
 }
 
-// QueueView returns a copy of the queue tracks and the current index.
-func (p *Player) QueueView() ([]subsonic.Song, int) {
+// QueueEntries returns the queue in play order and the position of the
+// current track (-1 if none).
+func (p *Player) QueueEntries() ([]queue.Entry, int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]subsonic.Song(nil), p.q.Tracks...), p.q.Index()
+	return p.q.Entries()
 }
 
 // ---------------- transport ----------------
@@ -753,12 +773,67 @@ func (p *Player) PlayTracks(tracks []subsonic.Song, start int, shuffle bool) {
 		return
 	}
 	p.mu.Lock()
-	p.endPreviewLocked(false)
-	p.q.Set(tracks, start, shuffle)
-	p.failStreak = 0
-	p.loadCurrentLocked(0, false, false)
+	p.playTracksLocked(tracks, start, shuffle, false)
 	p.mu.Unlock()
 	p.publish()
+}
+
+func (p *Player) playTracksLocked(tracks []subsonic.Song, start int, shuffle, library bool) {
+	p.endPreviewLocked(false)
+	p.q.Set(tracks, start, shuffle)
+	p.resetContLocked(library)
+	p.failStreak = 0
+	p.loadCurrentLocked(0, false, false)
+}
+
+// ShuffleLibrary replaces the queue with random songs from the whole
+// library and keeps adding more when they run out. It blocks while
+// fetching.
+func (p *Player) ShuffleLibrary(ctx context.Context) error {
+	c := p.Client()
+	if c == nil {
+		return errors.New("not connected to a server")
+	}
+	songs, err := c.GetRandomSongs(ctx, libraryBatch, "")
+	if err != nil {
+		return err
+	}
+	if len(songs) == 0 {
+		return errors.New("the library is empty")
+	}
+	p.mu.Lock()
+	p.playTracksLocked(songs, 0, true, true)
+	p.mu.Unlock()
+	p.publish()
+	return nil
+}
+
+// Enqueue adds tracks to the user queue: they play after the current track
+// (and anything queued before), ahead of the rest of the album or playlist.
+// With next they play right after the current track. If nothing is queued
+// or playback stopped at the end of the queue, playback starts. It returns
+// the number of tracks added.
+func (p *Player) Enqueue(tracks []subsonic.Song, next bool) int {
+	if len(tracks) == 0 {
+		return 0
+	}
+	p.mu.Lock()
+	_, had := p.q.Current()
+	n := p.q.Insert(tracks, next)
+	switch {
+	case !had:
+		p.resetContLocked(false)
+		p.failStreak = 0
+		p.loadCurrentLocked(0, false, false)
+	case p.ended && p.preview == nil && p.q.Advance(false):
+		p.loadCurrentLocked(0, false, false)
+	default:
+		p.updateNextLocked()
+	}
+	p.dirty.Store(true)
+	p.mu.Unlock()
+	p.publish()
+	return n
 }
 
 // PlayPause toggles playback.
@@ -890,6 +965,7 @@ func (p *Player) ClearQueue() {
 	p.mu.Lock()
 	p.endPreviewLocked(false)
 	p.q.Clear()
+	p.resetContLocked(false)
 	p.loadCurrentLocked(0, true, false)
 	p.tracks.Prefetch(nil)
 	p.mu.Unlock()

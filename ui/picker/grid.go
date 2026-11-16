@@ -52,6 +52,7 @@ const (
 	rowHeading
 	rowTrack
 	rowMessage
+	rowShuffleAll
 )
 
 // row is one element of the virtualized list.
@@ -67,6 +68,13 @@ type cell struct {
 	click   widget.Clickable
 	play    widgets.RoundButton
 	shuffle widgets.RoundButton
+	ctxTag  int
+}
+
+// trackRow holds the widget state of a track row.
+type trackRow struct {
+	click  widget.Clickable
+	ctxTag int
 }
 
 func (p *Panel) cell(k string) *cell {
@@ -78,10 +86,10 @@ func (p *Panel) cell(k string) *cell {
 	return c
 }
 
-func (p *Panel) trackClick(id string) *widget.Clickable {
+func (p *Panel) trackRow(id string) *trackRow {
 	c, ok := p.tracks[id]
 	if !ok {
-		c = new(widget.Clickable)
+		c = new(trackRow)
 		p.tracks[id] = c
 	}
 	return c
@@ -163,10 +171,16 @@ func (p *Panel) buildRowsLocked(vk viewKey) []row {
 		b.grid(playlistItems(p.d.playlists))
 		b.status(p.d.plState, len(p.d.playlists), "No playlists")
 	case vk.tab == tabArtists:
+		if len(p.d.artists) > 0 {
+			b.rows = append(b.rows, row{kind: rowShuffleAll})
+		}
 		b.grid(artistItems(p.d.artists))
 		b.status(p.d.arState, len(p.d.artists), "No artists")
 	default:
 		l := &p.d.albums[vk.tab]
+		if vk.tab == tabAlbums && len(l.albums) > 0 {
+			b.rows = append(b.rows, row{kind: rowShuffleAll})
+		}
 		b.grid(albumItems(l.albums, true))
 		b.status(l.loadState, len(l.albums), "No albums")
 	}
@@ -241,6 +255,16 @@ func (p *Panel) layoutRow(gtx layout.Context, r row, w, cw, g int) layout.Dimens
 			return p.layoutTrack(gtx, r.song)
 		})
 		return layout.Dimensions{Size: image.Pt(w, h)}
+	case rowShuffleAll:
+		if p.shuffleAll.Clicked(gtx) {
+			p.actions = append(p.actions, p.shuffleLibrary)
+		}
+		bh := gtx.Dp(theme.PillButtonHeight)
+		bw := gtx.Dp(170)
+		theme.Box(gtx, theme.Rect((w-bw)/2, 0, bw, bh), func(gtx layout.Context) layout.Dimensions {
+			return p.shuffleAll.Layout(gtx, th, "Shuffle library", false)
+		})
+		return layout.Dimensions{Size: image.Pt(w, bh+g)}
 	default:
 		h := gtx.Dp(64)
 		inset := gtx.Dp(8)
@@ -277,8 +301,7 @@ func (p *Panel) layoutCell(gtx layout.Context, it item) layout.Dimensions {
 
 	sz := gtx.Constraints.Min
 	cw := sz.X
-	playable := it.kind != kindArtist
-	hovered := c.click.Hovered() || playable && (c.play.Hovered() || c.shuffle.Hovered())
+	hovered := c.click.Hovered() || c.play.Hovered() || c.shuffle.Hovered()
 	radius := gtx.Dp(theme.CoverRadius)
 	if it.kind == kindArtist {
 		radius = -1
@@ -317,7 +340,7 @@ func (p *Panel) layoutCell(gtx layout.Context, it item) layout.Dimensions {
 		return layout.Dimensions{Size: sz}
 	})
 
-	if hovered && playable {
+	if hovered {
 		bs := gtx.Dp(theme.HoverButtonSize)
 		g := gtx.Dp(8)
 		x := (cw - 2*bs - g) / 2
@@ -329,11 +352,13 @@ func (p *Panel) layoutCell(gtx layout.Context, it item) layout.Dimensions {
 			return c.shuffle.Layout(gtx, th, theme.IconShuffle, widgets.StyleGlass, 0.5)
 		})
 	}
+	p.contextEvents(gtx, &c.ctxTag, image.Rectangle{Max: sz}, ctxTarget{it: it})
 	return layout.Dimensions{Size: sz}
 }
 
 // activate handles a click on a cover: artists open their albums, albums and
-// playlists start playing.
+// playlists start playing. The hover buttons play/shuffle any item,
+// artists included.
 func (p *Panel) activate(it item, shuffle bool) {
 	if it.kind == kindArtist {
 		p.openArtist(it.id, it.title)
@@ -344,11 +369,13 @@ func (p *Panel) activate(it item, shuffle bool) {
 
 func (p *Panel) layoutTrack(gtx layout.Context, s subsonic.Song) layout.Dimensions {
 	th := p.e.Theme
-	c := p.trackClick(s.ID)
+	tr := p.trackRow(s.ID)
+	c := &tr.click
 	for c.Clicked(gtx) {
 		p.actions = append(p.actions, func() { p.playSong(s) })
 	}
 	sz := gtx.Constraints.Min
+	defer p.contextEvents(gtx, &tr.ctxTag, image.Rectangle{Max: sz}, ctxTarget{song: s, isSong: true})
 	return c.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		r := image.Rectangle{Max: sz}
 		if c.Hovered() {

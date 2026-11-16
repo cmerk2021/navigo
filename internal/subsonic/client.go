@@ -96,6 +96,7 @@ type Song struct {
 	Track       int         `json:"track,omitempty"`
 	DiscNumber  int         `json:"discNumber,omitempty"`
 	Year        int         `json:"year,omitempty"`
+	Genre       string      `json:"genre,omitempty"`
 	BitRate     int         `json:"bitRate,omitempty"`
 	Size        int64       `json:"size,omitempty"`
 	ReplayGain  *ReplayGain `json:"replayGain,omitempty"`
@@ -166,6 +167,12 @@ type Response struct {
 	Playlist      *Playlist     `json:"playlist"`
 	SearchResult3 *SearchResult `json:"searchResult3"`
 	Song          *Song         `json:"song"`
+	RandomSongs   *songList     `json:"randomSongs"`
+	SimilarSongs  *songList     `json:"similarSongs"`
+}
+
+type songList struct {
+	Song []Song `json:"song"`
 }
 
 type envelope struct {
@@ -426,6 +433,34 @@ func (c *Client) GetSong(ctx context.Context, id string) (*Song, error) {
 		return nil, &Error{Code: 70, Message: "song"}
 	}
 	return r.Song, nil
+}
+
+// GetRandomSongs returns up to size (max. 500) random songs, optionally of
+// one genre.
+func (c *Client) GetRandomSongs(ctx context.Context, size int, genre string) ([]Song, error) {
+	v := url.Values{}
+	v.Set("size", strconv.Itoa(size))
+	if genre != "" {
+		v.Set("genre", genre)
+	}
+	r, err := c.call(ctx, "getRandomSongs", v)
+	if err != nil || r.RandomSongs == nil {
+		return nil, err
+	}
+	return r.RandomSongs.Song, nil
+}
+
+// GetSimilarSongs returns songs similar to a song, album or artist id. Many
+// servers need an external agent (e.g. Last.fm) and return nothing without.
+func (c *Client) GetSimilarSongs(ctx context.Context, id string, count int) ([]Song, error) {
+	v := url.Values{}
+	v.Set("id", id)
+	v.Set("count", strconv.Itoa(count))
+	r, err := c.call(ctx, "getSimilarSongs", v)
+	if err != nil || r.SimilarSongs == nil {
+		return nil, err
+	}
+	return r.SimilarSongs.Song, nil
 }
 
 // Search3 searches artists, albums and songs.

@@ -96,3 +96,99 @@ func TestRemoveAndUpcoming(t *testing.T) {
 		t.Fatal("invalid state not repaired")
 	}
 }
+
+func ids(q *Queue) string {
+	es, _ := q.Entries()
+	s := ""
+	for _, e := range es {
+		s += e.Song.ID
+		if e.Queued {
+			s += "*"
+		}
+		s += " "
+	}
+	return s
+}
+
+func named(names ...string) []subsonic.Song {
+	s := make([]subsonic.Song, len(names))
+	for i, n := range names {
+		s[i] = subsonic.Song{ID: n}
+	}
+	return s
+}
+
+func TestInsertUserQueue(t *testing.T) {
+	q := New()
+	q.Set(songs(4), 1, false) // 0 [1] 2 3
+	q.Insert(named("a"), false)
+	q.Insert(named("b", "c"), false)
+	q.Insert(named("n"), true)
+	if got, want := ids(q), "0 1 n* a* b* c* 2 3 "; got != want {
+		t.Fatalf("order %q, want %q", got, want)
+	}
+	// Without shuffle Tracks stays in play order.
+	if q.Tracks[2].ID != "n" || q.Tracks[6].ID != "2" {
+		t.Fatal("tracks not in play order", q.Tracks)
+	}
+	q.Advance(true)
+	if c, _ := q.Current(); c.ID != "n" {
+		t.Fatal(c.ID)
+	}
+	q.Insert(named("d"), false) // after the remaining queued tracks
+	if got, want := ids(q), "0 1 n a* b* c* d* 2 3 "; got != want {
+		t.Fatalf("order %q, want %q", got, want)
+	}
+	// Going back keeps queued tracks queued and still appends after them.
+	q.Previous()
+	q.Insert(named("e"), false)
+	if got, want := ids(q), "0 1 n a* b* c* d* e* 2 3 "; got != want {
+		t.Fatalf("order %q, want %q", got, want)
+	}
+	st := q.Snapshot(0)
+	q2 := New()
+	q2.Restore(st)
+	if ids(q2) != ids(q) {
+		t.Fatal("queued flags not restored", ids(q2))
+	}
+}
+
+func TestInsertShuffleKeepsQueuedNext(t *testing.T) {
+	for iter := 0; iter < 50; iter++ {
+		q := New()
+		q.Set(songs(6), 2, true)
+		q.Insert(named("a", "b"), false)
+		es, pos := q.Entries()
+		if es[pos+1].Song.ID != "a" || es[pos+2].Song.ID != "b" {
+			t.Fatal("queued tracks must play next", ids(q))
+		}
+		// Toggling shuffle keeps them right after the current track.
+		for _, on := range []bool{false, true} {
+			q.SetShuffle(on)
+			es, pos = q.Entries()
+			if c, _ := q.Current(); c.ID != "2" || es[pos+1].Song.ID != "a" || es[pos+2].Song.ID != "b" {
+				t.Fatal("shuffle toggle lost queued order", on, ids(q))
+			}
+		}
+		if len(es) != 8 {
+			t.Fatal(len(es))
+		}
+	}
+}
+
+func TestAppendAndEmptyInsert(t *testing.T) {
+	q := New()
+	q.Insert(named("a", "b"), false)
+	if c, _ := q.Current(); c.ID != "a" || q.Remaining() != 1 {
+		t.Fatal("insert into empty queue")
+	}
+	q.Insert(named("x"), false)
+	q.Append(named("c"))
+	if got, want := ids(q), "a x* b c "; got != want {
+		t.Fatalf("order %q, want %q", got, want)
+	}
+	q.Remove(1) // x
+	if got, want := ids(q), "a b c "; got != want {
+		t.Fatalf("order %q, want %q", got, want)
+	}
+}
